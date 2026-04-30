@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import math
 import torch
 import torch.nn as nn
 from itertools import chain
@@ -57,6 +58,8 @@ class PPO:
         symmetry_cfg: dict | None = None,
         # Distributed training parameters
         multi_gpu_cfg: dict | None = None,
+        # Entropy coefficient scheduling
+        entropy_schedule_total_iters: int | None = None,
     ) -> None:
         """Initialize the algorithm with models, storage, and optimization settings."""
         # Device-related parameters
@@ -102,7 +105,13 @@ class PPO:
         self.num_learning_epochs = num_learning_epochs
         self.num_mini_batches = num_mini_batches
         self.value_loss_coef = value_loss_coef
-        self.entropy_coef = entropy_coef
+        self._entropy_schedule_cfg = entropy_coef if isinstance(entropy_coef, dict) else None
+        if self._entropy_schedule_cfg is not None:
+            self.entropy_coef = float(self._entropy_schedule_cfg.get("entropy_coef", 0.01))
+        else:
+            self.entropy_coef = float(entropy_coef)
+        self._entropy_schedule_total_iters = entropy_schedule_total_iters
+        self._entropy_schedule_step = 0
         self.gamma = gamma
         self.lam = lam
         self.max_grad_norm = max_grad_norm
@@ -186,6 +195,8 @@ class PPO:
 
     def update(self) -> dict[str, float]:
         """Run optimization epochs over stored batches and return mean losses."""
+        self._update_entropy_coef()
+
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
@@ -360,6 +371,7 @@ class PPO:
             "actor_state_dict": self._raw_actor.state_dict(),
             "critic_state_dict": self._raw_critic.state_dict(),
             "optimizer_state_dict": self.optimizer.state_dict(),
+            "entropy_schedule_step": self._entropy_schedule_step,
         }
         if self.rnd:
             saved_dict["rnd_state_dict"] = self.rnd.state_dict()
@@ -385,6 +397,8 @@ class PPO:
             self._raw_critic.load_state_dict(loaded_dict["critic_state_dict"], strict=strict)
         if load_cfg.get("optimizer"):
             self.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
+        if "entropy_schedule_step" in loaded_dict:
+            self._entropy_schedule_step = int(loaded_dict["entropy_schedule_step"])
         if load_cfg.get("rnd") and self.rnd:
             self.rnd.load_state_dict(loaded_dict["rnd_state_dict"], strict=strict)
             self.rnd.optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
@@ -393,6 +407,41 @@ class PPO:
     def get_policy(self) -> MLPModel:
         """Get the policy model."""
         return self._raw_actor
+
+    def _update_entropy_coef(self) -> None:
+        """Update the entropy coefficient when a schedule config is provided."""
+        cfg = self._entropy_schedule_cfg
+        if cfg is None:
+            return
+
+        total_iters = self._entropy_schedule_total_iters
+        step = self._entropy_schedule_step
+        if total_iters is None or total_iters <= 1:
+            progress = 1.0
+        else:
+            progress = step / float(max(total_iters - 1, 1))
+
+        initial = float(cfg.get("entropy_coef", 0.01))
+        target = float(cfg.get("schedule_target", initial))
+        start_ratio = float(cfg.get("start_ratio", 0.0))
+        end_ratio = float(cfg.get("end_ratio", 1.0))
+
+        if progress <= start_ratio:
+            entropy_coef = initial
+        elif progress >= end_ratio or end_ratio <= start_ratio:
+            entropy_coef = target
+        else:
+            alpha = (progress - start_ratio) / (end_ratio - start_ratio)
+            schedule_type = cfg.get("schedule", "linear")
+            if schedule_type == "exp" and initial > 1e-8 and target > 1e-8:
+                entropy_coef = math.exp(math.log(initial) + alpha * (math.log(target) - math.log(initial)))
+            elif schedule_type == "cosine":
+                entropy_coef = target + 0.5 * (initial - target) * (1 + math.cos(math.pi * alpha))
+            else:
+                entropy_coef = initial + alpha * (target - initial)
+
+        self.entropy_coef = entropy_coef
+        self._entropy_schedule_step = step + 1
 
     def compile(self, mode: str | None = None) -> None:
         """Compile actor and critic with ``torch.compile``.
@@ -437,6 +486,8 @@ class PPO:
         storage = RolloutStorage("rl", env.num_envs, cfg["num_steps_per_env"], obs, [env.num_actions], device)
 
         # Initialize the algorithm
+        if isinstance(cfg["algorithm"].get("entropy_coef"), dict):
+            cfg["algorithm"]["entropy_schedule_total_iters"] = cfg.get("max_iterations")
         alg: PPO = alg_class(actor, critic, storage, device=device, **cfg["algorithm"], multi_gpu_cfg=cfg["multi_gpu"])
 
         # Compile the algorithm's models if requested
