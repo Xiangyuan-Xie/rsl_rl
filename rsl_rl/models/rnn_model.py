@@ -9,10 +9,11 @@ from __future__ import annotations
 import copy
 import torch
 import torch.nn as nn
+from typing import Literal
 from tensordict import TensorDict
 
 from rsl_rl.models.mlp_model import MLPModel
-from rsl_rl.modules import RNN, HiddenState
+from rsl_rl.modules import MLP, RNN, HiddenState
 
 
 class RNNModel(MLPModel):
@@ -40,6 +41,7 @@ class RNNModel(MLPModel):
         rnn_type: str = "lstm",
         rnn_hidden_dim: int = 256,
         rnn_num_layers: int = 1,
+        structure: Literal["gru_mlp", "mlp_gru"] = "gru_mlp",
     ) -> None:
         """Initialize the RNN-based model.
 
@@ -55,8 +57,13 @@ class RNNModel(MLPModel):
             rnn_type: Type of RNN to use ("lstm" or "gru").
             rnn_hidden_dim: Dimension of the RNN hidden state.
             rnn_num_layers: Number of RNN layers.
+            structure: Model ordering. ``"gru_mlp"`` keeps the upstream ``obs -> RNN -> MLP`` behavior;
+                ``"mlp_gru"`` uses ``obs -> encoder MLP -> RNN -> linear head``.
         """
-        self.latent_dim = rnn_hidden_dim
+        if structure not in {"gru_mlp", "mlp_gru"}:
+            raise ValueError(f"Unsupported structure: {structure}")
+        self.structure = structure
+        self.rnn_hidden_dim = int(rnn_hidden_dim)
 
         # Initialize the parent MLP model
         super().__init__(
@@ -71,7 +78,24 @@ class RNNModel(MLPModel):
         )
 
         # RNN
-        self.rnn = RNN(self.obs_dim, rnn_hidden_dim, rnn_num_layers, rnn_type)
+        if self.structure == "gru_mlp":
+            self.rnn = RNN(self.obs_dim, rnn_hidden_dim, rnn_num_layers, rnn_type)
+        else:
+            model_output_dim = self.distribution.input_dim if self.distribution is not None else output_dim
+            self.encoder = MLP(self.obs_dim, rnn_hidden_dim, hidden_dims, activation)
+            self.rnn = RNN(rnn_hidden_dim, rnn_hidden_dim, rnn_num_layers, rnn_type)
+            if isinstance(model_output_dim, int):
+                self.mlp = nn.Sequential(nn.Linear(self._get_latent_dim(), model_output_dim))
+            else:
+                total_output_dim = 1
+                for dim in model_output_dim:
+                    total_output_dim *= dim
+                self.mlp = nn.Sequential(
+                    nn.Linear(self._get_latent_dim(), total_output_dim),
+                    nn.Unflatten(dim=-1, unflattened_size=model_output_dim),
+                )
+            if self.distribution is not None:
+                self.distribution.init_mlp_weights(self.mlp)
 
     def get_latent(
         self, obs: TensorDict, masks: torch.Tensor | None = None, hidden_state: HiddenState = None
@@ -79,6 +103,8 @@ class RNNModel(MLPModel):
         """Build the model latent by passing normalized observation groups through the RNN."""
         # Extract and concatenate observation groups and normalize
         latent = super().get_latent(obs)
+        if self.structure == "mlp_gru":
+            latent = self.encoder(latent)
         # Pass through the RNN
         latent = self.rnn(latent, masks, hidden_state).squeeze(0)
         return latent
@@ -110,7 +136,7 @@ class RNNModel(MLPModel):
 
     def _get_latent_dim(self) -> int:
         """Return the latent dimensionality consumed by the MLP head."""
-        return self.latent_dim
+        return self.rnn_hidden_dim
 
 
 class _TorchGRUModel(nn.Module):
@@ -119,7 +145,9 @@ class _TorchGRUModel(nn.Module):
     def __init__(self, model: RNNModel) -> None:
         """Create a TorchScript-friendly copy of a GRU-based RNNModel."""
         super().__init__()
+        self.structure = model.structure
         self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
+        self.encoder = copy.deepcopy(model.encoder) if model.structure == "mlp_gru" else nn.Identity()
         self.rnn = copy.deepcopy(model.rnn.rnn)  # Access underlying torch module to avoid wrapper logic during export
         self.mlp = copy.deepcopy(model.mlp)
         if model.distribution is not None:
@@ -132,6 +160,8 @@ class _TorchGRUModel(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run one GRU inference step and update hidden states."""
         x = self.obs_normalizer(x)
+        if self.structure == "mlp_gru":
+            x = self.encoder(x)
         x, h = self.rnn(x.unsqueeze(0), self.hidden_state)
         self.hidden_state[:] = h  # type: ignore
         x = x.squeeze(0)
@@ -150,7 +180,9 @@ class _TorchLSTMModel(nn.Module):
     def __init__(self, model: RNNModel) -> None:
         """Create a TorchScript-friendly copy of an LSTM-based RNNModel."""
         super().__init__()
+        self.structure = model.structure
         self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
+        self.encoder = copy.deepcopy(model.encoder) if model.structure == "mlp_gru" else nn.Identity()
         self.rnn = copy.deepcopy(model.rnn.rnn)  # Access underlying torch module to avoid wrapper logic during export
         self.mlp = copy.deepcopy(model.mlp)
         if model.distribution is not None:
@@ -163,6 +195,8 @@ class _TorchLSTMModel(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Run one LSTM inference step and update hidden and cell states."""
         x = self.obs_normalizer(x)
+        if self.structure == "mlp_gru":
+            x = self.encoder(x)
         x, (h, c) = self.rnn(x.unsqueeze(0), (self.hidden_state, self.cell_state))
         self.hidden_state[:] = h  # type: ignore
         self.cell_state[:] = c  # type: ignore
@@ -186,7 +220,9 @@ class _OnnxRNNModel(nn.Module):
         """Create an ONNX-export wrapper around an RNNModel."""
         super().__init__()
         self.verbose = verbose
+        self.structure = model.structure
         self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
+        self.encoder = copy.deepcopy(model.encoder) if model.structure == "mlp_gru" else nn.Identity()
         self.rnn = copy.deepcopy(model.rnn.rnn)  # Access underlying torch module to avoid wrapper logic during export
         self.mlp = copy.deepcopy(model.mlp)
         if model.distribution is not None:
@@ -211,6 +247,8 @@ class _OnnxRNNModel(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
         """Run deterministic inference for ONNX export."""
         x = self.obs_normalizer(obs)
+        if self.structure == "mlp_gru":
+            x = self.encoder(x)
 
         if self.rnn_type == "lstm":
             x, (h, c) = self.rnn(x.unsqueeze(0), (h_in, c_in))

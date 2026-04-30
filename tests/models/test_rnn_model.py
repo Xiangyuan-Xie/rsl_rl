@@ -38,6 +38,31 @@ def _make_rnn_model(rnn_type: str = "gru", **kwargs: object) -> tuple[RNNModel, 
     return model, obs
 
 
+@pytest.mark.parametrize("structure", ["gru_mlp", "mlp_gru"])
+def test_rnn_model_structure_forward_and_hidden_state(structure: str) -> None:
+    """Both supported recurrent orderings should run forward and keep hidden state."""
+    model, obs = _make_rnn_model(structure=structure)
+
+    output = model(obs)
+
+    assert output.shape == (NUM_ENVS, NUM_ACTIONS)
+    assert model.get_hidden_state().shape == (1, NUM_ENVS, 16)
+    if structure == "mlp_gru":
+        assert model.rnn.rnn.input_size == 16
+        assert hasattr(model, "encoder")
+    else:
+        assert model.rnn.rnn.input_size == OBS_DIM
+        assert not hasattr(model, "encoder")
+
+
+def test_rnn_model_rejects_unknown_structure() -> None:
+    """Invalid structure values should fail at construction time."""
+    obs = make_obs(NUM_ENVS, OBS_DIM)
+
+    with pytest.raises(ValueError, match="Unsupported structure"):
+        RNNModel(obs, {"actor": ["policy"]}, "actor", NUM_ACTIONS, structure="rnn_magic")
+
+
 class TestHiddenStateReset:
     """Tests for hidden state reset behavior on done environments."""
 
