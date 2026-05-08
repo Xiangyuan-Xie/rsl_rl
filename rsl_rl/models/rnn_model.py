@@ -9,8 +9,8 @@ from __future__ import annotations
 import copy
 import torch
 import torch.nn as nn
-from typing import Literal
 from tensordict import TensorDict
+from typing import Literal
 
 from rsl_rl.models.mlp_model import MLPModel
 from rsl_rl.modules import MLP, RNN, HiddenState

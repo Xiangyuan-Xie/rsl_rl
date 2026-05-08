@@ -123,6 +123,9 @@ class OnPolicyRunner:
                 action_std=self.alg.get_policy().output_std,
                 rnd_weight=self.alg.rnd.weight if self.cfg["algorithm"]["rnd_cfg"] else None,
             )
+            post_log_callback = getattr(self, "_post_log_callback", None)
+            if post_log_callback is not None:
+                post_log_callback(self)
 
             # Save model
             if self.logger.writer is not None and it % self.cfg["save_interval"] == 0:

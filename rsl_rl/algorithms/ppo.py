@@ -416,10 +416,7 @@ class PPO:
 
         total_iters = self._entropy_schedule_total_iters
         step = self._entropy_schedule_step
-        if total_iters is None or total_iters <= 1:
-            progress = 1.0
-        else:
-            progress = step / float(max(total_iters - 1, 1))
+        progress = 1.0 if total_iters is None or total_iters <= 1 else step / float(max(total_iters - 1, 1))
 
         initial = float(cfg.get("entropy_coef", 0.01))
         target = float(cfg.get("schedule_target", initial))

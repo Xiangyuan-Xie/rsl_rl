@@ -171,6 +171,20 @@ class TestLearnLoop:
         runner.learn(num_learning_iterations=3)
         assert runner.current_learning_iteration == 2
 
+    def test_learn_calls_post_log_callback_after_each_iteration(self) -> None:
+        """Optional post-log hooks should see each completed learning iteration."""
+        runner = _build_runner()
+        callback_iterations: list[int] = []
+
+        def _record_iteration(callback_runner: OnPolicyRunner) -> None:
+            callback_iterations.append(callback_runner.current_learning_iteration)
+
+        runner._post_log_callback = _record_iteration
+
+        runner.learn(num_learning_iterations=2)
+
+        assert callback_iterations == [0, 1]
+
 
 class TestSaveLoad:
     """Tests for checkpoint save and load."""
