@@ -9,7 +9,8 @@ from __future__ import annotations
 import numpy as np
 import torch
 import torch.nn as nn
-from torch.distributions import Normal
+import torch.nn.functional
+from torch.distributions import Beta, Normal
 
 
 class Distribution(nn.Module):
@@ -325,6 +326,128 @@ class HeteroscedasticGaussianDistribution(GaussianDistribution):
             torch.nn.init.constant_(mlp[-2].bias[self.output_dim :], init_std_log)  # type: ignore
 
 
+class BetaDistribution(Distribution):
+    """Beta distribution module for actions that live directly in the unit interval.
+
+    The MLP emits ``[..., 2, output_dim]`` where the first slice is a mean logit and the second slice is a raw
+    concentration. The deterministic policy is ``sigmoid(mean_logit)``. This keeps deployed actions in ``[0, 1]``
+    without requiring a separate environment-side sigmoid mapping.
+    """
+
+    def __init__(
+        self,
+        output_dim: int,
+        init_concentration: float = 4.0,
+        min_concentration: float = 1e-3,
+        max_concentration: float = 100.0,
+        eps: float = 1e-6,
+    ) -> None:
+        """Initialize the Beta distribution module.
+
+        Args:
+            output_dim: Dimension of the action/output space.
+            init_concentration: Initial alpha+beta concentration used for MLP head initialization.
+            min_concentration: Positive floor applied to concentration and alpha/beta parameters.
+            max_concentration: Upper clamp for concentration to keep KL and entropy numerically stable.
+            eps: Clamp margin for log-probability inputs at the open Beta support boundary.
+        """
+        super().__init__(output_dim)
+        if init_concentration <= 0.0:
+            raise ValueError(f"init_concentration must be positive, got {init_concentration}.")
+        if min_concentration <= 0.0:
+            raise ValueError(f"min_concentration must be positive, got {min_concentration}.")
+        if init_concentration <= min_concentration:
+            raise ValueError(
+                "init_concentration must be greater than min_concentration, "
+                f"got {(init_concentration, min_concentration)}."
+            )
+        if max_concentration <= min_concentration:
+            raise ValueError(
+                "max_concentration must be greater than min_concentration, "
+                f"got {(min_concentration, max_concentration)}."
+            )
+        if eps <= 0.0 or eps >= 0.5:
+            raise ValueError(f"eps must be in (0, 0.5), got {eps}.")
+
+        self.init_concentration = float(init_concentration)
+        self.min_concentration = float(min_concentration)
+        self.max_concentration = float(max_concentration)
+        self.eps = float(eps)
+        self._distribution: Beta | None = None
+
+        # Disable args validation for speedup; log_prob clamps boundary inputs explicitly.
+        Beta.set_default_validate_args(False)
+
+    def update(self, mlp_output: torch.Tensor) -> None:
+        """Update the Beta distribution from mean logits and raw concentration."""
+        mean_logit, raw_concentration = torch.unbind(mlp_output, dim=-2)
+        mean = torch.sigmoid(mean_logit)
+        concentration = torch.nn.functional.softplus(raw_concentration) + self.min_concentration
+        concentration = torch.clamp(concentration, max=self.max_concentration)
+        alpha = torch.clamp(mean * concentration, min=self.min_concentration)
+        beta = torch.clamp((1.0 - mean) * concentration, min=self.min_concentration)
+        self._distribution = Beta(alpha, beta)
+
+    def sample(self) -> torch.Tensor:
+        """Sample from the Beta distribution."""
+        return self._distribution.sample()  # type: ignore
+
+    def deterministic_output(self, mlp_output: torch.Tensor) -> torch.Tensor:
+        """Return the mean parameter as a bounded deterministic action."""
+        return torch.sigmoid(mlp_output[..., 0, :])
+
+    def as_deterministic_output_module(self) -> nn.Module:
+        """Return export-friendly module that converts mean logits to unit-interval actions."""
+        return _BetaMeanDeterministicOutput()
+
+    @property
+    def input_dim(self) -> list[int]:
+        """Return the input shape required by the distribution."""
+        return [2, self.output_dim]
+
+    @property
+    def mean(self) -> torch.Tensor:
+        """Return the mean of the Beta distribution."""
+        return self._distribution.mean  # type: ignore
+
+    @property
+    def std(self) -> torch.Tensor:
+        """Return the standard deviation of the Beta distribution."""
+        return self._distribution.stddev  # type: ignore
+
+    @property
+    def entropy(self) -> torch.Tensor:
+        """Return the entropy of the Beta distribution, summed over the last dimension."""
+        return self._distribution.entropy().sum(dim=-1)  # type: ignore
+
+    @property
+    def params(self) -> tuple[torch.Tensor, ...]:
+        """Return (alpha, beta) of the current Beta distribution."""
+        return (self._distribution.concentration1, self._distribution.concentration0)  # type: ignore
+
+    def log_prob(self, outputs: torch.Tensor) -> torch.Tensor:
+        """Compute the log probability under the Beta distribution, summed over the last dimension."""
+        outputs = torch.clamp(outputs, self.eps, 1.0 - self.eps)
+        return self._distribution.log_prob(outputs).sum(dim=-1)  # type: ignore
+
+    def kl_divergence(self, old_params: tuple[torch.Tensor, ...], new_params: tuple[torch.Tensor, ...]) -> torch.Tensor:
+        """Compute KL(old || new) between two Beta distributions."""
+        old_alpha, old_beta = old_params
+        new_alpha, new_beta = new_params
+        old_dist = Beta(old_alpha, old_beta)
+        new_dist = Beta(new_alpha, new_beta)
+        return torch.distributions.kl_divergence(old_dist, new_dist).sum(dim=-1)
+
+    def init_mlp_weights(self, mlp: nn.Module) -> None:
+        """Initialize the mean head to 0.5 and concentration head to ``init_concentration``."""
+        linear = mlp[-2] if isinstance(mlp[-1], nn.Unflatten) else mlp[-1]
+        torch.nn.init.zeros_(linear.weight[: self.output_dim])  # type: ignore
+        torch.nn.init.zeros_(linear.bias[: self.output_dim])  # type: ignore
+        torch.nn.init.zeros_(linear.weight[self.output_dim :])  # type: ignore
+        concentration_raw = torch.log(torch.expm1(torch.tensor(self.init_concentration - self.min_concentration)))
+        torch.nn.init.constant_(linear.bias[self.output_dim :], float(concentration_raw))  # type: ignore
+
+
 class _IdentityDeterministicOutput(nn.Module):
     """Exportable module that returns the MLP output as is."""
 
@@ -337,3 +460,10 @@ class _MeanSliceDeterministicOutput(nn.Module):
 
     def forward(self, mlp_output: torch.Tensor) -> torch.Tensor:
         return mlp_output[..., 0, :]
+
+
+class _BetaMeanDeterministicOutput(nn.Module):
+    """Exportable module that converts Beta mean logits into normalized deterministic actions."""
+
+    def forward(self, mlp_output: torch.Tensor) -> torch.Tensor:
+        return torch.sigmoid(mlp_output[..., 0, :])

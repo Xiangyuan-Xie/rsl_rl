@@ -75,6 +75,23 @@ class TestMLPModelModes:
         expected = critic.mlp(latent)
         assert torch.allclose(output, expected)
 
+    def test_beta_distribution_returns_unit_interval_actions(self) -> None:
+        """Beta policies should expose 4D normalized actions, not the raw 2x head."""
+        actor, obs = _make_mlp_model(
+            stochastic=True,
+            distribution_cfg={"class_name": "BetaDistribution", "init_concentration": 4.0},
+        )
+
+        deterministic_output = actor(obs, stochastic_output=False)
+        stochastic_output = actor(obs, stochastic_output=True)
+
+        assert deterministic_output.shape == (NUM_ENVS, NUM_ACTIONS)
+        assert stochastic_output.shape == (NUM_ENVS, NUM_ACTIONS)
+        assert torch.all(deterministic_output >= 0.0)
+        assert torch.all(deterministic_output <= 1.0)
+        assert torch.all(stochastic_output >= 0.0)
+        assert torch.all(stochastic_output <= 1.0)
+
 
 class TestMLPModelNormalization:
     """Tests for observation normalization integration."""

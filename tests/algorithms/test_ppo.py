@@ -43,7 +43,12 @@ def _build_ppo(**overrides: object) -> tuple[PPO, TensorDict]:
     """Build a PPO instance with small networks for testing."""
     obs = make_obs(NUM_ENVS, OBS_DIM)
     obs_groups = {"actor": ["policy"], "critic": ["policy"]}
-    actor = _make_actor(obs, obs_groups, NUM_ACTIONS)
+    actor_cfg = overrides.pop("actor_cfg", None)
+    actor = (
+        _make_actor(obs, obs_groups, NUM_ACTIONS, **actor_cfg)
+        if actor_cfg is not None
+        else _make_actor(obs, obs_groups, NUM_ACTIONS)
+    )
     critic = _make_critic(obs, obs_groups)
     storage = RolloutStorage("rl", NUM_ENVS, NUM_STEPS, obs, [NUM_ACTIONS])
 
@@ -271,6 +276,39 @@ class TestPPOLosses:
         #   max = 0.16
         expected = (0.25 + 0.16) / 2
         assert torch.allclose(loss, torch.tensor(expected), atol=1e-5)
+
+    def test_update_reports_beta_policy_diagnostics(self) -> None:
+        """Beta policies should report boundary and concentration diagnostics with the PPO losses."""
+        ppo, obs = _build_ppo(
+            actor_cfg={"distribution_cfg": {"class_name": "BetaDistribution", "init_concentration": 4.0}},
+            num_learning_epochs=1,
+            num_mini_batches=1,
+            schedule="fixed",
+        )
+
+        for _ in range(NUM_STEPS):
+            t = RolloutStorage.Transition()
+            t.observations = obs
+            t.hidden_states = (None, None)
+            t.actions = ppo.actor(obs, stochastic_output=True).detach()
+            t.values = ppo.critic(obs).detach()
+            t.actions_log_prob = ppo.actor.get_output_log_prob(t.actions).detach()
+            t.distribution_params = tuple(p.detach() for p in ppo.actor.output_distribution_params)
+            t.rewards = torch.randn(NUM_ENVS)
+            t.dones = torch.zeros(NUM_ENVS)
+            ppo.storage.add_transition(t)
+        ppo.compute_returns(obs)
+
+        losses = ppo.update()
+
+        assert "beta_alpha_min" in losses
+        assert "beta_beta_min" in losses
+        assert "beta_concentration_mean" in losses
+        assert "beta_boundary_action_frac" in losses
+        assert "beta_entropy_min" in losses
+        assert 0.0 <= losses["beta_boundary_action_frac"] <= 1.0
+        assert losses["beta_alpha_min"] > 0.0
+        assert losses["beta_beta_min"] > 0.0
 
 
 class TestAdaptiveLearningRate:

@@ -63,6 +63,25 @@ def test_rnn_model_rejects_unknown_structure() -> None:
         RNNModel(obs, {"actor": ["policy"]}, "actor", NUM_ACTIONS, structure="rnn_magic")
 
 
+@pytest.mark.parametrize("structure", ["gru_mlp", "mlp_gru"])
+def test_rnn_model_beta_distribution_returns_unit_interval_actions(structure: str) -> None:
+    """Beta recurrent policies should expose 4D normalized actions, not the raw 2x head."""
+    model, obs = _make_rnn_model(
+        structure=structure,
+        distribution_cfg={"class_name": "BetaDistribution", "init_concentration": 4.0},
+    )
+
+    deterministic_output = model(obs, stochastic_output=False)
+    stochastic_output = model(obs, stochastic_output=True)
+
+    assert deterministic_output.shape == (NUM_ENVS, NUM_ACTIONS)
+    assert stochastic_output.shape == (NUM_ENVS, NUM_ACTIONS)
+    assert torch.all(deterministic_output >= 0.0)
+    assert torch.all(deterministic_output <= 1.0)
+    assert torch.all(stochastic_output >= 0.0)
+    assert torch.all(stochastic_output <= 1.0)
+
+
 class TestHiddenStateReset:
     """Tests for hidden state reset behavior on done environments."""
 

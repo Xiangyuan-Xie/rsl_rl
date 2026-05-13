@@ -200,6 +200,12 @@ class PPO:
         mean_value_loss = 0
         mean_surrogate_loss = 0
         mean_entropy = 0
+        beta_alpha_min = float("inf")
+        beta_beta_min = float("inf")
+        beta_concentration_mean = 0
+        beta_boundary_action_frac = 0
+        beta_entropy_min = float("inf")
+        beta_diagnostics_updates = 0
         # RND loss
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
@@ -237,6 +243,17 @@ class PPO:
             # Note: We only keep the following tensors for the original samples in case of symmetry augmentation
             distribution_params = tuple(p[:original_batch_size] for p in self.actor.output_distribution_params)
             entropy = self.actor.output_entropy[:original_batch_size]
+            if type(getattr(self.actor, "distribution", None)).__name__ == "BetaDistribution":
+                alpha, beta = distribution_params
+                original_actions = batch.actions[:original_batch_size]
+                beta_alpha_min = min(beta_alpha_min, alpha.min().item())
+                beta_beta_min = min(beta_beta_min, beta.min().item())
+                beta_concentration_mean += (alpha + beta).mean().item()
+                beta_boundary_action_frac += (
+                    torch.logical_or(original_actions < 0.02, original_actions > 0.98).float().mean().item()
+                )
+                beta_entropy_min = min(beta_entropy_min, entropy.min().item())
+                beta_diagnostics_updates += 1
 
             # Compute KL divergence and adapt the learning rate
             if self.desired_kl is not None and self.schedule == "adaptive":
@@ -334,6 +351,9 @@ class PPO:
             mean_rnd_loss /= num_updates
         if mean_symmetry_loss is not None:
             mean_symmetry_loss /= num_updates
+        if beta_diagnostics_updates:
+            beta_concentration_mean /= beta_diagnostics_updates
+            beta_boundary_action_frac /= beta_diagnostics_updates
 
         # Construct the loss dictionary
         loss_dict = {
@@ -341,6 +361,14 @@ class PPO:
             "surrogate": mean_surrogate_loss,
             "entropy": mean_entropy,
         }
+        if beta_diagnostics_updates:
+            loss_dict.update({
+                "beta_alpha_min": beta_alpha_min,
+                "beta_beta_min": beta_beta_min,
+                "beta_concentration_mean": beta_concentration_mean,
+                "beta_boundary_action_frac": beta_boundary_action_frac,
+                "beta_entropy_min": beta_entropy_min,
+            })
         if self.rnd:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:

@@ -7,8 +7,11 @@
 
 import math
 import torch
+import torch.nn as nn
 
-from rsl_rl.modules.distribution import GaussianDistribution, HeteroscedasticGaussianDistribution
+import pytest
+
+from rsl_rl.modules.distribution import BetaDistribution, GaussianDistribution, HeteroscedasticGaussianDistribution
 
 
 class TestGaussianDistribution:
@@ -249,3 +252,97 @@ class TestHeteroscedasticGaussianDistribution:
         """The minimum of std_range should be floored to 1e-6 for numerical stability."""
         dist = HeteroscedasticGaussianDistribution(output_dim=2, init_std=1.0, std_type="scalar", std_range=(0.0, 10.0))
         assert dist.std_range[0] == 1e-6
+
+
+class TestBetaDistribution:
+    """Tests for ``BetaDistribution``."""
+
+    def test_input_dim_is_mean_logit_and_concentration_pair(self) -> None:
+        """input_dim should be [2, output_dim] for mean logits and raw concentration."""
+        dist = BetaDistribution(output_dim=5)
+        assert dist.input_dim == [2, 5]
+
+    def test_deterministic_output_returns_sigmoid_mean(self) -> None:
+        """deterministic_output() should convert mean logits to unit-interval actions."""
+        dist = BetaDistribution(output_dim=3)
+        mean_logits = torch.tensor([[0.0, 2.0, -2.0]])
+        raw_concentration = torch.zeros_like(mean_logits)
+        mlp_output = torch.stack([mean_logits, raw_concentration], dim=-2)
+
+        result = dist.deterministic_output(mlp_output)
+
+        assert torch.allclose(result, torch.sigmoid(mean_logits), atol=1e-6)
+
+    def test_update_builds_positive_alpha_beta_and_unit_interval_mean(self) -> None:
+        """update() should produce valid Beta parameters and bounded means."""
+        dist = BetaDistribution(output_dim=2, init_concentration=4.0, min_concentration=1e-3)
+        mean_logits = torch.tensor([[0.0, 1.0]])
+        raw_concentration = torch.tensor([[0.5, -0.5]])
+        mlp_output = torch.stack([mean_logits, raw_concentration], dim=-2)
+
+        dist.update(mlp_output)
+        alpha, beta = dist.params
+
+        assert torch.all(alpha > 0.0)
+        assert torch.all(beta > 0.0)
+        assert torch.all(dist.mean > 0.0)
+        assert torch.all(dist.mean < 1.0)
+        assert torch.allclose(dist.mean, torch.sigmoid(mean_logits), atol=1e-6)
+
+    def test_sample_stays_in_unit_interval(self) -> None:
+        """Samples from the Beta distribution should be valid normalized actions."""
+        dist = BetaDistribution(output_dim=4)
+        mlp_output = torch.zeros(128, 2, 4)
+        dist.update(mlp_output)
+
+        sample = dist.sample()
+
+        assert sample.shape == (128, 4)
+        assert torch.all(sample >= 0.0)
+        assert torch.all(sample <= 1.0)
+
+    def test_log_prob_clamps_boundary_actions(self) -> None:
+        """log_prob() should remain finite for actions exactly at the unit interval edges."""
+        dist = BetaDistribution(output_dim=2)
+        dist.update(torch.zeros(1, 2, 2))
+
+        log_p = dist.log_prob(torch.tensor([[0.0, 1.0]]))
+
+        assert torch.isfinite(log_p).all()
+
+    def test_kl_divergence_identical_is_zero(self) -> None:
+        """KL(p || p) should be zero for identical Beta parameters."""
+        dist = BetaDistribution(output_dim=3)
+        alpha = torch.full((2, 3), 2.0)
+        beta = torch.full((2, 3), 3.0)
+
+        kl = dist.kl_divergence((alpha, beta), (alpha, beta))
+
+        assert torch.allclose(kl, torch.zeros(2), atol=1e-6)
+
+    def test_log_prob_gradient_flows_to_mlp_output(self) -> None:
+        """log_prob should allow gradients to flow through mean and concentration heads."""
+        dist = BetaDistribution(output_dim=3)
+        mlp_output = torch.randn(2, 2, 3, requires_grad=True)
+        dist.update(mlp_output)
+
+        sample = dist.sample().detach()
+        dist.log_prob(sample).sum().backward()
+
+        assert mlp_output.grad is not None
+        assert not torch.all(mlp_output.grad == 0)
+
+    def test_init_mlp_weights_sets_initial_mean_to_half(self) -> None:
+        """The distribution initializer should make the initial deterministic action 0.5."""
+        dist = BetaDistribution(output_dim=4, init_concentration=4.0)
+        mlp = nn.Sequential(nn.Linear(6, 8), nn.Unflatten(dim=-1, unflattened_size=[2, 4]))
+
+        dist.init_mlp_weights(mlp)
+        output = mlp(torch.randn(3, 6))
+
+        assert torch.allclose(dist.deterministic_output(output), torch.full((3, 4), 0.5), atol=1e-6)
+
+    def test_init_concentration_must_exceed_min_concentration(self) -> None:
+        """Initialization should reject concentrations that cannot be represented above the configured floor."""
+        with pytest.raises(ValueError, match="init_concentration must be greater than min_concentration"):
+            BetaDistribution(output_dim=2, init_concentration=1e-3, min_concentration=1e-3)
