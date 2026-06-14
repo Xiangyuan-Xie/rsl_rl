@@ -169,6 +169,34 @@ class TestSequentialConsistency:
         )
 
 
+class TestRNNModelStructure:
+    """Tests for RNN/MLP ordering options."""
+
+    def test_mlp_gru_structure_places_encoder_before_rnn(self) -> None:
+        model, obs = _make_rnn_model(structure="mlp_gru", hidden_dims=[32, 16])
+
+        assert model.structure == "mlp_gru"
+        assert hasattr(model, "encoder")
+        assert model.encoder[0].in_features == OBS_DIM
+        assert model.rnn.rnn.input_size == 16
+        assert model.mlp[0].in_features == 16
+
+        output = model(obs)
+        assert output.shape == (NUM_ENVS, NUM_ACTIONS)
+
+    def test_default_structure_keeps_upstream_gru_mlp_behavior(self) -> None:
+        model, _obs = _make_rnn_model(hidden_dims=[32, 16])
+
+        assert model.structure == "gru_mlp"
+        assert not hasattr(model, "encoder")
+        assert model.rnn.rnn.input_size == OBS_DIM
+        assert model.mlp[0].in_features == 16
+
+    def test_invalid_structure_is_rejected(self) -> None:
+        with pytest.raises(ValueError, match="Unsupported structure"):
+            _make_rnn_model(structure="cnn_gru")
+
+
 class TestRNNModelJITExport:
     """Tests for JIT export fidelity of RNN models."""
 
