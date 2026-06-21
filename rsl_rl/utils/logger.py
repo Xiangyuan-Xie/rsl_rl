@@ -320,13 +320,21 @@ class Logger:
                     continue
                 # Write the diff file
                 print(f"Storing git diff for '{repo_name}' in: {diff_file_name}")
-                with open(diff_file_name, "x", encoding="utf-8") as f:
+                try:
+                    git_status = repo.git.status()
+                    git_diff = repo.git.diff(t)
                     content = (
                         f"--- git commit ---\n{commit_hash}\n\n\n"
-                        f"--- git status ---\n{repo.git.status()} \n\n\n"
-                        f"--- git diff ---\n{repo.git.diff(t)}"
+                        f"--- git status ---\n{git_status} \n\n\n"
+                        f"--- git diff ---\n{git_diff}"
                     )
-                    f.write(content)
+                    with open(diff_file_name, "x", encoding="utf-8") as f:
+                        f.write(content)
+                except Exception as exc:
+                    print(f"Could not store git diff for '{repo_name}': {exc}. Skipping.")
+                    if os.path.isfile(diff_file_name):
+                        os.remove(diff_file_name)
+                    continue
                 # Add the file path to the list of files to be uploaded
                 files_to_upload.append(diff_file_name)
         return files_to_upload
