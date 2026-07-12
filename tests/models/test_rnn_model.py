@@ -173,6 +173,7 @@ class TestRNNModelStructure:
     """Tests for RNN/MLP ordering options."""
 
     def test_mlp_gru_structure_places_encoder_before_rnn(self) -> None:
+        """The mlp_gru structure should encode observations before recurrence."""
         model, obs = _make_rnn_model(structure="mlp_gru", hidden_dims=[32, 16])
 
         assert model.structure == "mlp_gru"
@@ -185,6 +186,7 @@ class TestRNNModelStructure:
         assert output.shape == (NUM_ENVS, NUM_ACTIONS)
 
     def test_default_structure_keeps_upstream_gru_mlp_behavior(self) -> None:
+        """The default structure should preserve the upstream GRU-first layout."""
         model, _obs = _make_rnn_model(hidden_dims=[32, 16])
 
         assert model.structure == "gru_mlp"
@@ -193,6 +195,7 @@ class TestRNNModelStructure:
         assert model.mlp[0].in_features == 16
 
     def test_invalid_structure_is_rejected(self) -> None:
+        """Unknown RNN/MLP structures should fail during construction."""
         with pytest.raises(ValueError, match="Unsupported structure"):
             _make_rnn_model(structure="cnn_gru")
 
@@ -254,6 +257,92 @@ class TestRNNModelJITExport:
             jit_out = jit_model(obs_concat)
 
         assert torch.allclose(original_out, jit_out, atol=1e-5), f"JIT sequential mismatch for {rnn_type}"
+
+
+class TestRNNModelExplicitStateJITExport:
+    """Tests for batch-safe GRU exports with caller-owned hidden state."""
+
+    def _export(
+        self, num_envs: int = NUM_ENVS, distribution_cfg: dict | None = None
+    ) -> tuple[RNNModel, TensorDict, torch.jit.ScriptModule]:
+        obs = make_obs(num_envs, OBS_DIM)
+        model = RNNModel(
+            obs,
+            {"actor": ["policy"]},
+            "actor",
+            NUM_ACTIONS,
+            hidden_dims=[32, 16],
+            activation="elu",
+            rnn_type="gru",
+            rnn_hidden_dim=16,
+            rnn_num_layers=2,
+            structure="mlp_gru",
+            distribution_cfg=distribution_cfg,
+        ).eval()
+        return model, obs, torch.jit.script(model.as_jit_with_explicit_state())
+
+    def test_export_matches_model_and_exposes_contract_metadata(self) -> None:
+        """Explicit-state export should match the model and publish its contract."""
+        distribution_cfg = {"class_name": "GaussianDistribution", "init_std": 0.5, "std_type": "scalar"}
+        model, obs, exported = self._export(distribution_cfg=distribution_cfg)
+        hidden = torch.zeros(2, NUM_ENVS, 16)
+        model.reset(hidden_state=hidden.clone())
+
+        expected = model(obs, stochastic_output=False).detach()
+        obs_concat = torch.cat([obs[group] for group in model.obs_groups], dim=-1)
+        actions, next_hidden = exported(obs_concat, hidden)
+
+        assert torch.allclose(actions, expected, atol=1e-5)
+        assert torch.allclose(next_hidden, model.get_hidden_state(), atol=1e-5)
+        assert exported.format_version == 1
+        assert exported.observation_dim == OBS_DIM
+        assert exported.action_dim == NUM_ACTIONS
+        assert exported.num_layers == 2
+        assert exported.hidden_size == 16
+
+    def test_caller_owned_hidden_state_preserves_sequence_context(self) -> None:
+        """Feeding returned state into the next call should preserve context."""
+        model, obs, exported = self._export()
+        obs_concat = torch.cat([obs[group] for group in model.obs_groups], dim=-1)
+        hidden = torch.zeros(2, NUM_ENVS, 16)
+
+        first_actions, hidden = exported(obs_concat, hidden)
+        second_actions, second_hidden = exported(obs_concat, hidden)
+
+        assert not torch.allclose(first_actions, second_actions)
+        assert not torch.allclose(hidden, second_hidden)
+
+    def test_export_accepts_different_batch_sizes(self) -> None:
+        """An exported policy should not bind recurrent state to one batch size."""
+        _model, _obs, exported = self._export()
+
+        for num_envs in (1, 7):
+            actions, hidden = exported(torch.randn(num_envs, OBS_DIM), torch.zeros(2, num_envs, 16))
+            assert actions.shape == (num_envs, NUM_ACTIONS)
+            assert hidden.shape == (2, num_envs, 16)
+
+    def test_beta_export_is_deterministic(self) -> None:
+        """Beta policies should export their deterministic distribution mean."""
+        model, obs, exported = self._export(
+            distribution_cfg={"class_name": "BetaDistribution", "action_range": (-1.0, 1.0)}
+        )
+        hidden = torch.zeros(2, NUM_ENVS, 16)
+        model.reset(hidden_state=hidden.clone())
+        expected = model(obs, stochastic_output=False).detach()
+        obs_concat = torch.cat([obs[group] for group in model.obs_groups], dim=-1)
+
+        first, _ = exported(obs_concat, hidden)
+        second, _ = exported(obs_concat, hidden)
+
+        assert torch.allclose(first, expected, atol=1e-5)
+        assert torch.equal(first, second)
+
+    def test_explicit_state_export_rejects_lstm(self) -> None:
+        """The v1 explicit-state contract should reject unsupported LSTM models."""
+        model, _obs = _make_rnn_model(rnn_type="lstm")
+
+        with pytest.raises(NotImplementedError, match="only supports GRU"):
+            model.as_jit_with_explicit_state()
 
 
 @pytest.mark.filterwarnings("ignore:.*legacy TorchScript.*:DeprecationWarning")

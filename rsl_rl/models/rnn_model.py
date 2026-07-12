@@ -76,6 +76,7 @@ class RNNModel(MLPModel):
             obs_normalization,
             distribution_cfg,
         )
+        self.output_dim = output_dim
 
         # RNN
         if self.structure == "gru_mlp":
@@ -130,6 +131,12 @@ class RNNModel(MLPModel):
         else:
             raise NotImplementedError(f"Unsupported RNN type: {type(self.rnn.rnn)}")
 
+    def as_jit_with_explicit_state(self) -> nn.Module:
+        """Return a batch-safe Torch JIT export with caller-owned GRU state."""
+        if not isinstance(self.rnn.rnn, nn.GRU):
+            raise NotImplementedError("Explicit-state JIT export currently only supports GRU models.")
+        return _TorchGRUModelWithExplicitState(self)
+
     def as_onnx(self, verbose: bool = False) -> nn.Module:
         """Return a version of the model compatible with ONNX export."""
         return _OnnxRNNModel(self, verbose)
@@ -172,6 +179,37 @@ class _TorchGRUModel(nn.Module):
     def reset(self) -> None:
         """Reset exported GRU hidden states to zeros."""
         self.hidden_state[:] = 0.0  # type: ignore
+
+
+class _TorchGRUModelWithExplicitState(nn.Module):
+    """Exportable GRU model whose recurrent state is owned by the caller."""
+
+    def __init__(self, model: RNNModel) -> None:
+        super().__init__()
+        self.structure = model.structure
+        self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
+        self.encoder = copy.deepcopy(model.encoder) if model.structure == "mlp_gru" else nn.Identity()
+        self.rnn = copy.deepcopy(model.rnn.rnn)
+        self.mlp = copy.deepcopy(model.mlp)
+        if model.distribution is not None:
+            self.deterministic_output = model.distribution.as_deterministic_output_module()
+        else:
+            self.deterministic_output = nn.Identity()
+
+        self.format_version = 1
+        self.observation_dim = model.obs_dim
+        self.action_dim = model.output_dim
+        self.num_layers = self.rnn.num_layers
+        self.hidden_size = self.rnn.hidden_size
+
+    def forward(self, observations: torch.Tensor, hidden_state: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Run one deterministic inference step with explicit GRU state."""
+        x = self.obs_normalizer(observations)
+        if self.structure == "mlp_gru":
+            x = self.encoder(x)
+        x, next_hidden_state = self.rnn(x.unsqueeze(0), hidden_state)
+        actions = self.deterministic_output(self.mlp(x.squeeze(0)))
+        return actions, next_hidden_state
 
 
 class _TorchLSTMModel(nn.Module):
