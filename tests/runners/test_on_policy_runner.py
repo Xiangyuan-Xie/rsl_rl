@@ -231,6 +231,60 @@ class TestSaveLoad:
             runner.load(f.name)
             assert runner.current_learning_iteration == saved_iter
 
+    def test_load_can_restore_optimizer_state_while_preserving_configured_learning_rate(self) -> None:
+        """Resume can keep Adam history without inheriting the checkpoint learning rate."""
+        runner = _build_runner()
+        runner.learn(num_learning_iterations=2)
+        runner.alg.learning_rate = 4.0e-3
+        for param_group in runner.alg.optimizer.param_groups:
+            param_group["lr"] = 4.0e-3
+
+        with tempfile.NamedTemporaryFile(suffix=".pt") as f:
+            runner.save(f.name)
+            saved_iteration = runner.current_learning_iteration
+            saved_optimizer_state = copy.deepcopy(runner.alg.optimizer.state_dict()["state"])
+
+            resumed_runner = _build_runner()
+            resumed_runner.alg.learning_rate = 3.0e-4
+            for param_group in resumed_runner.alg.optimizer.param_groups:
+                param_group["lr"] = 3.0e-4
+            resumed_runner.load(
+                f.name,
+                load_cfg={
+                    "actor": True,
+                    "critic": True,
+                    "optimizer": True,
+                    "iteration": True,
+                    "rnd": True,
+                    "learning_rate": False,
+                },
+            )
+
+            assert resumed_runner.current_learning_iteration == saved_iteration
+            assert resumed_runner.alg.learning_rate == 3.0e-4
+            assert all(group["lr"] == 3.0e-4 for group in resumed_runner.alg.optimizer.param_groups)
+            restored_optimizer_state = resumed_runner.alg.optimizer.state_dict()["state"]
+            assert restored_optimizer_state.keys() == saved_optimizer_state.keys()
+            for parameter_id, state in restored_optimizer_state.items():
+                assert state["step"] == saved_optimizer_state[parameter_id]["step"]
+                assert torch.equal(state["exp_avg"], saved_optimizer_state[parameter_id]["exp_avg"])
+                assert torch.equal(state["exp_avg_sq"], saved_optimizer_state[parameter_id]["exp_avg_sq"])
+
+    def test_default_load_still_restores_checkpoint_learning_rate(self) -> None:
+        """The new load option must not change the existing default behavior."""
+        runner = _build_runner()
+        runner.alg.learning_rate = 4.0e-3
+        for param_group in runner.alg.optimizer.param_groups:
+            param_group["lr"] = 4.0e-3
+
+        with tempfile.NamedTemporaryFile(suffix=".pt") as f:
+            runner.save(f.name)
+            resumed_runner = _build_runner()
+            resumed_runner.load(f.name)
+
+            assert resumed_runner.alg.learning_rate == 4.0e-3
+            assert all(group["lr"] == 4.0e-3 for group in resumed_runner.alg.optimizer.param_groups)
+
     def test_load_restores_normalization_stats(self) -> None:
         """Running-mean stats should be identical after save and load."""
         cfg = _make_train_cfg("mlp")

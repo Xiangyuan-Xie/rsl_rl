@@ -11,7 +11,7 @@ import torch
 from tensordict import TensorDict
 
 from rsl_rl.algorithms.ppo import PPO
-from rsl_rl.models import MLPModel
+from rsl_rl.models import MLPModel, RNNModel
 from rsl_rl.storage import RolloutStorage
 from tests.conftest import make_obs
 
@@ -197,6 +197,53 @@ class TestGAEComputation:
         assert abs(adv.std().item() - 1.0) < 0.1, "Advantages should be unit-std"
 
 
+def test_recurrent_split_actor_updates_with_feedforward_critic() -> None:
+    """PPO should align padded actor trajectories with an unpadded MLP critic."""
+    obs = make_obs(NUM_ENVS, OBS_DIM)
+    obs_groups = {"actor": ["policy"], "critic": ["policy"]}
+    actor = RNNModel(
+        obs,
+        obs_groups,
+        "actor",
+        NUM_ACTIONS,
+        hidden_dims=[32, 16],
+        activation="elu",
+        rnn_type="gru",
+        rnn_hidden_dim=16,
+        rnn_num_layers=1,
+        structure="split_gru_mlp",
+        recurrent_obs_range=(2, 8),
+        bypass_obs_range=(0, 4),
+        distribution_cfg={"class_name": "GaussianDistribution", "init_std": 1.0, "std_type": "scalar"},
+    )
+    critic = _make_critic(obs, obs_groups)
+    storage = RolloutStorage("rl", NUM_ENVS, NUM_STEPS, obs, [NUM_ACTIONS])
+    ppo = PPO(
+        actor,
+        critic,
+        storage,
+        num_learning_epochs=2,
+        num_mini_batches=2,
+        schedule="fixed",
+    )
+
+    with torch.inference_mode():
+        for step in range(NUM_STEPS):
+            actions = ppo.act(obs)
+            assert actions.shape == (NUM_ENVS, NUM_ACTIONS)
+            dones = torch.zeros(NUM_ENVS)
+            if step in (2, 5):
+                dones[step % NUM_ENVS] = 1.0
+            ppo.process_env_step(obs, torch.randn(NUM_ENVS), dones, {})
+
+        ppo.compute_returns(obs)
+    metrics = ppo.update()
+
+    assert actor.is_recurrent
+    assert not critic.is_recurrent
+    assert all(torch.isfinite(value).all() for value in metrics.values() if isinstance(value, torch.Tensor))
+
+
 class TestTimeoutBootstrapping:
     """Tests for timeout bootstrapping in ``process_env_step``."""
 
@@ -318,3 +365,70 @@ class TestAdaptiveLearningRate:
             ppo.learning_rate = min(1e-2, ppo.learning_rate * 1.5)
 
         assert ppo.learning_rate == initial_lr
+
+
+def test_checkpoint_load_preserves_configured_rnd_learning_rate_and_restores_adam_state() -> None:
+    """The resume learning-rate policy applies to the auxiliary RND optimizer as well."""
+
+    def rnd_cfg(learning_rate: float) -> dict:
+        return {
+            "num_states": OBS_DIM,
+            "obs_groups": {"rnd_state": ["policy"]},
+            "num_outputs": 4,
+            "predictor_hidden_dims": [8],
+            "target_hidden_dims": [8],
+            "learning_rate": learning_rate,
+        }
+
+    source, obs = _build_ppo(rnd_cfg=rnd_cfg(4.0e-3))
+    source.rnd.optimizer.zero_grad()
+    source.rnd.compute_loss(obs).backward()
+    source.rnd.optimizer.step()
+    saved = source.save()
+
+    resumed, _ = _build_ppo(rnd_cfg=rnd_cfg(7.0e-4))
+    resumed.load(
+        saved,
+        {
+            "actor": True,
+            "critic": True,
+            "optimizer": True,
+            "iteration": True,
+            "rnd": True,
+            "learning_rate": False,
+        },
+        strict=True,
+    )
+
+    assert all(group["lr"] == 7.0e-4 for group in resumed.rnd.optimizer.param_groups)
+    restored_state = resumed.rnd.optimizer.state_dict()["state"]
+    saved_state = saved["rnd_optimizer_state_dict"]["state"]
+    assert restored_state.keys() == saved_state.keys()
+    for parameter_id, state in restored_state.items():
+        assert torch.equal(state["exp_avg"], saved_state[parameter_id]["exp_avg"])
+        assert torch.equal(state["exp_avg_sq"], saved_state[parameter_id]["exp_avg_sq"])
+
+
+def test_checkpoint_load_preserves_current_learning_rate_for_fixed_and_adaptive_schedules() -> None:
+    """Both schedules start resumed updates from the current configuration's initial rate."""
+    for schedule in ("fixed", "adaptive"):
+        source, _ = _build_ppo(schedule=schedule, learning_rate=4.0e-3)
+        saved = source.save()
+        resumed, _ = _build_ppo(schedule=schedule, learning_rate=3.0e-4)
+
+        resumed.load(
+            saved,
+            {
+                "actor": True,
+                "critic": True,
+                "optimizer": True,
+                "iteration": True,
+                "rnd": True,
+                "learning_rate": False,
+            },
+            strict=True,
+        )
+
+        assert resumed.schedule == schedule
+        assert resumed.learning_rate == 3.0e-4
+        assert all(group["lr"] == 3.0e-4 for group in resumed.optimizer.param_groups)

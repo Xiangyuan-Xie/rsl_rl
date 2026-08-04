@@ -387,11 +387,31 @@ class PPO:
         if load_cfg.get("critic"):
             self._raw_critic.load_state_dict(loaded_dict["critic_state_dict"], strict=strict)
         if load_cfg.get("optimizer"):
+            current_learning_rates = [param_group["lr"] for param_group in self.optimizer.param_groups]
             self.optimizer.load_state_dict(loaded_dict["optimizer_state_dict"])
-            self.learning_rate = self.optimizer.param_groups[0]["lr"]
+            if load_cfg.get("learning_rate", True):
+                self.learning_rate = self.optimizer.param_groups[0]["lr"]
+            else:
+                if len(current_learning_rates) != len(self.optimizer.param_groups):
+                    raise RuntimeError(
+                        "Cannot preserve configured learning rates because the checkpoint optimizer has a different "
+                        "number of parameter groups."
+                    )
+                for param_group, learning_rate in zip(self.optimizer.param_groups, current_learning_rates):
+                    param_group["lr"] = learning_rate
+                self.learning_rate = current_learning_rates[0]
         if load_cfg.get("rnd") and self.rnd:
+            current_rnd_learning_rates = [param_group["lr"] for param_group in self.rnd.optimizer.param_groups]
             self.rnd.load_state_dict(loaded_dict["rnd_state_dict"], strict=strict)
             self.rnd.optimizer.load_state_dict(loaded_dict["rnd_optimizer_state_dict"])
+            if not load_cfg.get("learning_rate", True):
+                if len(current_rnd_learning_rates) != len(self.rnd.optimizer.param_groups):
+                    raise RuntimeError(
+                        "Cannot preserve configured RND learning rates because the checkpoint optimizer has a "
+                        "different number of parameter groups."
+                    )
+                for param_group, learning_rate in zip(self.rnd.optimizer.param_groups, current_rnd_learning_rates):
+                    param_group["lr"] = learning_rate
         return load_cfg.get("iteration", False)
 
     def get_policy(self) -> MLPModel:
