@@ -15,6 +15,7 @@ import torch
 from tensordict import TensorDict
 
 from rsl_rl.models import RNNModel
+from rsl_rl.utils import split_and_pad_trajectories
 from tests.conftest import make_obs
 
 NUM_ENVS = 4
@@ -35,6 +36,31 @@ def _make_rnn_model(rnn_type: str = "gru", **kwargs: object) -> tuple[RNNModel, 
     )
     defaults.update(kwargs)
     model = RNNModel(obs, obs_groups, "actor", NUM_ACTIONS, **defaults)
+    return model, obs
+
+
+def _make_cnn_gru_model(observation_dim: int = 72) -> tuple[RNNModel, TensorDict]:
+    obs = make_obs(NUM_ENVS, observation_dim)
+    model = RNNModel(
+        obs,
+        {"actor": ["policy"]},
+        "actor",
+        NUM_ACTIONS,
+        hidden_dims=[48],
+        activation="elu",
+        rnn_type="gru",
+        rnn_hidden_dim=32,
+        rnn_num_layers=1,
+        structure="split_cnn_gru_mlp",
+        recurrent_obs_range=(55, observation_dim),
+        cnn_obs_range=(0, 55),
+        cnn_obs_shape=(11, 5),
+        cnn_channels=(32, 32, 8),
+        cnn_kernel_size=3,
+        cnn_output_dim=32,
+        shortcut_obs_range=(55, 64),
+        distribution_cfg={"class_name": "BetaDistribution", "action_range": (0.0, 1.0)},
+    )
     return model, obs
 
 
@@ -216,6 +242,59 @@ class TestRNNModelStructure:
 
         assert torch.allclose(actual, expected)
         assert torch.allclose(model.get_hidden_state(), expected_hidden)
+
+    def test_split_cnn_gru_mlp_matches_am_pose_contract(self) -> None:
+        """The AM Pose temporal encoder must preserve all three branch widths and parameter count."""
+        model, obs = _make_cnn_gru_model()
+
+        assert model.rnn.rnn.input_size == 17
+        assert model.mlp[0].in_features == 73
+        assert model.cnn_encoder[0].in_channels == 5
+        assert model.cnn_encoder[0].out_channels == 32
+        assert model.cnn_encoder[2].out_channels == 32
+        assert model.cnn_encoder[4].out_channels == 8
+        assert model.cnn_encoder[-1].in_features == 40
+        assert model.cnn_encoder[-1].out_features == 32
+        assert sum(parameter.numel() for parameter in model.parameters()) == 14_544
+        assert model(obs).shape == (NUM_ENVS, NUM_ACTIONS)
+
+        dual_model, dual_obs = _make_cnn_gru_model(observation_dim=78)
+        assert dual_model.rnn.rnn.input_size == 23
+        assert sum(parameter.numel() for parameter in dual_model.parameters()) == 15_120
+        assert dual_model(dual_obs).shape == (NUM_ENVS, NUM_ACTIONS)
+
+    def test_split_cnn_gru_mlp_uses_current_and_future_trajectory_points(self) -> None:
+        """Both endpoints of the 11-point sequence must influence the CNN latent."""
+        model, _obs = _make_cnn_gru_model()
+        baseline = torch.zeros(NUM_ENVS, 72)
+        first_changed = baseline.clone()
+        first_changed[:, 0] = 1.0
+        last_changed = baseline.clone()
+        last_changed[:, 54] = 1.0
+
+        def encode(observations: torch.Tensor) -> torch.Tensor:
+            trajectory = observations[:, :55].reshape(-1, 11, 5).transpose(1, 2)
+            return model.cnn_encoder(trajectory)
+
+        assert not torch.allclose(encode(baseline), encode(first_changed))
+        assert not torch.allclose(encode(baseline), encode(last_changed))
+
+    def test_split_cnn_gru_mlp_unpads_all_branches_with_recurrent_masks(self) -> None:
+        """CNN and shortcut samples must follow the same valid-step mask as GRU outputs."""
+        model, _obs = _make_cnn_gru_model()
+        observations = TensorDict(
+            {"policy": torch.randn(5, 2, 72)},
+            batch_size=[5, 2],
+        )
+        dones = torch.zeros(5, 2, dtype=torch.bool)
+        dones[1, 0] = True
+        padded, masks = split_and_pad_trajectories(observations, dones)
+        hidden = torch.zeros(1, masks.shape[1], 32)
+
+        output = model(padded, masks=masks, hidden_state=hidden)
+
+        assert output.shape == (5, 2, NUM_ACTIONS)
+        assert torch.all(torch.isfinite(output))
 
     @pytest.mark.parametrize(
         ("kwargs", "message"),
@@ -418,6 +497,25 @@ class TestRNNModelExplicitStateJITExport:
         assert exported.bypass_obs_end == 4
         assert exported.fusion_order == "gru_hidden,bypass"
 
+    def test_cnn_split_export_matches_model_and_records_v3_contract(self) -> None:
+        """Explicit-state v3 export must retain CNN and shortcut metadata and numerics."""
+        model, obs = _make_cnn_gru_model()
+        exported = torch.jit.script(model.as_jit_with_explicit_state())
+        hidden = torch.zeros(1, NUM_ENVS, 32)
+        model.reset(hidden_state=hidden.clone())
+        expected = model(obs).detach()
+
+        actions, next_hidden = exported(obs["policy"], hidden)
+
+        assert torch.allclose(actions, expected, atol=1.0e-5)
+        assert torch.allclose(next_hidden, model.get_hidden_state(), atol=1.0e-5)
+        assert exported.format_version == 3
+        assert (exported.cnn_obs_start, exported.cnn_obs_end) == (0, 55)
+        assert (exported.cnn_time, exported.cnn_features) == (11, 5)
+        assert list(exported.cnn_channels) == [32, 32, 8]
+        assert (exported.shortcut_obs_start, exported.shortcut_obs_end) == (55, 64)
+        assert exported.fusion_order == "gru_hidden,cnn_latent,shortcut"
+
 
 @pytest.mark.filterwarnings("ignore:.*legacy TorchScript.*:DeprecationWarning")
 @pytest.mark.filterwarnings("ignore:.*will be removed.*:DeprecationWarning")
@@ -494,6 +592,31 @@ class TestRNNModelONNXExport:
             torch.onnx.export(
                 exported,
                 inputs,
+                file.name,
+                export_params=True,
+                opset_version=18,
+                input_names=exported.input_names,
+                output_names=exported.output_names,
+            )
+            onnx.checker.check_model(onnx.load(file.name))
+
+    def test_split_cnn_gru_mlp_onnx_export_matches_model(self) -> None:
+        """The ONNX wrapper must preserve CNN, GRU, and shortcut fusion."""
+        model, obs = _make_cnn_gru_model()
+        model = model.eval()
+        exported = model.as_onnx(verbose=False).eval()
+        hidden = torch.zeros(1, NUM_ENVS, 32)
+        model.reset(hidden_state=hidden.clone())
+
+        expected = model(obs, stochastic_output=False).detach()
+        actual, next_hidden, _ = exported(obs["policy"], hidden)
+
+        assert torch.allclose(actual, expected, atol=1.0e-5)
+        assert torch.allclose(next_hidden, model.get_hidden_state(), atol=1.0e-5)
+        with tempfile.NamedTemporaryFile(suffix=".onnx") as file:
+            torch.onnx.export(
+                exported,
+                exported.get_dummy_inputs(),
                 file.name,
                 export_params=True,
                 opset_version=18,

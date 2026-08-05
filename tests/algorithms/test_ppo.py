@@ -244,6 +244,56 @@ def test_recurrent_split_actor_updates_with_feedforward_critic() -> None:
     assert all(torch.isfinite(value).all() for value in metrics.values() if isinstance(value, torch.Tensor))
 
 
+def test_cnn_gru_split_actor_updates_with_feedforward_critic() -> None:
+    """PPO should train the AM Pose CNN-GRU actor with padded recurrent minibatches."""
+    obs = make_obs(NUM_ENVS, 72)
+    obs_groups = {"actor": ["policy"], "critic": ["policy"]}
+    actor = RNNModel(
+        obs,
+        obs_groups,
+        "actor",
+        NUM_ACTIONS,
+        hidden_dims=[48],
+        activation="elu",
+        rnn_type="gru",
+        rnn_hidden_dim=32,
+        rnn_num_layers=1,
+        structure="split_cnn_gru_mlp",
+        recurrent_obs_range=(55, 72),
+        cnn_obs_range=(0, 55),
+        cnn_obs_shape=(11, 5),
+        cnn_channels=(32, 32, 8),
+        cnn_kernel_size=3,
+        cnn_output_dim=32,
+        shortcut_obs_range=(55, 64),
+        distribution_cfg={"class_name": "BetaDistribution", "action_range": (0.0, 1.0)},
+    )
+    critic = _make_critic(obs, obs_groups)
+    storage = RolloutStorage("rl", NUM_ENVS, NUM_STEPS, obs, [NUM_ACTIONS])
+    ppo = PPO(
+        actor,
+        critic,
+        storage,
+        num_learning_epochs=2,
+        num_mini_batches=2,
+        schedule="fixed",
+    )
+
+    with torch.inference_mode():
+        for step in range(NUM_STEPS):
+            actions = ppo.act(obs)
+            assert actions.shape == (NUM_ENVS, NUM_ACTIONS)
+            dones = torch.zeros(NUM_ENVS)
+            if step in (2, 5):
+                dones[step % NUM_ENVS] = 1.0
+            ppo.process_env_step(obs, torch.randn(NUM_ENVS), dones, {})
+        ppo.compute_returns(obs)
+    metrics = ppo.update()
+
+    assert all(torch.isfinite(value).all() for value in metrics.values() if isinstance(value, torch.Tensor))
+    assert all(parameter.grad is None or torch.all(torch.isfinite(parameter.grad)) for parameter in actor.parameters())
+
+
 class TestTimeoutBootstrapping:
     """Tests for timeout bootstrapping in ``process_env_step``."""
 
