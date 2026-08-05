@@ -43,9 +43,8 @@ class RNNModel(MLPModel):
         rnn_type: str = "lstm",
         rnn_hidden_dim: int = 256,
         rnn_num_layers: int = 1,
-        structure: Literal["gru_mlp", "mlp_gru", "split_gru_mlp", "split_cnn_gru_mlp"] = "gru_mlp",
+        structure: Literal["gru_mlp", "mlp_gru", "split_cnn_gru_mlp"] = "gru_mlp",
         recurrent_obs_range: tuple[int, int] | list[int] | None = None,
-        bypass_obs_range: tuple[int, int] | list[int] | None = None,
         cnn_obs_range: tuple[int, int] | list[int] | None = None,
         cnn_obs_shape: tuple[int, int] | list[int] | None = None,
         cnn_channels: tuple[int, ...] | list[int] | None = None,
@@ -68,10 +67,9 @@ class RNNModel(MLPModel):
             rnn_hidden_dim: Dimension of the RNN hidden state.
             rnn_num_layers: Number of RNN layers.
             structure: Network ordering. ``"gru_mlp"`` keeps the upstream ``obs -> RNN -> MLP`` behavior;
-                ``"mlp_gru"`` uses ``obs -> encoder MLP -> RNN -> linear head``; ``"split_gru_mlp"`` sends one
-                observation slice through a GRU and concatenates its hidden state with a direct observation slice.
-            recurrent_obs_range: Half-open observation range passed through the GRU by ``"split_gru_mlp"``.
-            bypass_obs_range: Half-open observation range concatenated after the GRU by ``"split_gru_mlp"``.
+                ``"mlp_gru"`` uses ``obs -> encoder MLP -> RNN -> linear head``; ``"split_cnn_gru_mlp"``
+                fuses recurrent state, temporal trajectory features, and a direct state shortcut.
+            recurrent_obs_range: Half-open observation range passed through the GRU by ``"split_cnn_gru_mlp"``.
             cnn_obs_range: Half-open trajectory range processed by ``"split_cnn_gru_mlp"``.
             cnn_obs_shape: Trajectory shape as ``(time, channels)`` before the temporal convolutions.
             cnn_channels: Output channel count for each valid Conv1d layer.
@@ -79,30 +77,11 @@ class RNNModel(MLPModel):
             cnn_output_dim: Dimension of the linear projection after the flattened convolutions.
             shortcut_obs_range: Half-open direct-feedback range concatenated at the fusion layer.
         """
-        if structure not in {"gru_mlp", "mlp_gru", "split_gru_mlp", "split_cnn_gru_mlp"}:
+        if structure not in {"gru_mlp", "mlp_gru", "split_cnn_gru_mlp"}:
             raise ValueError(f"Unsupported structure: {structure}")
-        if structure == "split_gru_mlp":
-            if rnn_type.lower() != "gru":
-                raise ValueError("split_gru_mlp only supports GRU recurrent modules.")
-            if any(
-                value is not None
-                for value in (
-                    cnn_obs_range,
-                    cnn_obs_shape,
-                    cnn_channels,
-                    cnn_kernel_size,
-                    cnn_output_dim,
-                    shortcut_obs_range,
-                )
-            ):
-                raise ValueError("CNN branch settings are not valid with structure='split_gru_mlp'.")
-            recurrent_obs_range = self._validate_obs_range("recurrent_obs_range", recurrent_obs_range)
-            bypass_obs_range = self._validate_obs_range("bypass_obs_range", bypass_obs_range)
-        elif structure == "split_cnn_gru_mlp":
+        if structure == "split_cnn_gru_mlp":
             if rnn_type.lower() != "gru":
                 raise ValueError("split_cnn_gru_mlp only supports GRU recurrent modules.")
-            if bypass_obs_range is not None:
-                raise ValueError("bypass_obs_range is not valid with structure='split_cnn_gru_mlp'.")
             recurrent_obs_range = self._validate_obs_range("recurrent_obs_range", recurrent_obs_range)
             cnn_obs_range = self._validate_obs_range("cnn_obs_range", cnn_obs_range)
             shortcut_obs_range = self._validate_obs_range("shortcut_obs_range", shortcut_obs_range)
@@ -127,7 +106,6 @@ class RNNModel(MLPModel):
             value is not None
             for value in (
                 recurrent_obs_range,
-                bypass_obs_range,
                 cnn_obs_range,
                 cnn_obs_shape,
                 cnn_channels,
@@ -139,7 +117,6 @@ class RNNModel(MLPModel):
             raise ValueError("Observation branch settings are only valid with a split network structure.")
         self.structure = structure
         self.recurrent_obs_range = recurrent_obs_range
-        self.bypass_obs_range = bypass_obs_range
         self.cnn_obs_range = cnn_obs_range
         self.cnn_obs_shape = cnn_obs_shape
         self.cnn_channels = cnn_channels
@@ -150,8 +127,6 @@ class RNNModel(MLPModel):
             assert shortcut_obs_range is not None
             assert cnn_output_dim is not None
             self.latent_dim = rnn_hidden_dim + cnn_output_dim + shortcut_obs_range[1] - shortcut_obs_range[0]
-        elif bypass_obs_range is not None:
-            self.latent_dim = rnn_hidden_dim + bypass_obs_range[1] - bypass_obs_range[0]
         else:
             self.latent_dim = rnn_hidden_dim
 
@@ -168,15 +143,7 @@ class RNNModel(MLPModel):
         )
         self.output_dim = output_dim
 
-        if self.structure == "split_gru_mlp":
-            assert recurrent_obs_range is not None
-            assert bypass_obs_range is not None
-            if recurrent_obs_range[1] > self.obs_dim or bypass_obs_range[1] > self.obs_dim:
-                raise ValueError(
-                    "split_gru_mlp observation ranges must fit within the concatenated observation dimension "
-                    f"{self.obs_dim}, got recurrent={recurrent_obs_range} and bypass={bypass_obs_range}."
-                )
-        elif self.structure == "split_cnn_gru_mlp":
+        if self.structure == "split_cnn_gru_mlp":
             assert recurrent_obs_range is not None
             assert cnn_obs_range is not None
             assert shortcut_obs_range is not None
@@ -239,16 +206,6 @@ class RNNModel(MLPModel):
         latent = super().get_latent(obs)
         if self.structure == "mlp_gru":
             latent = self.encoder(latent)
-        elif self.structure == "split_gru_mlp":
-            assert self.recurrent_obs_range is not None
-            assert self.bypass_obs_range is not None
-            recurrent_start, recurrent_end = self.recurrent_obs_range
-            bypass_start, bypass_end = self.bypass_obs_range
-            recurrent_latent = self.rnn(latent[..., recurrent_start:recurrent_end], masks, hidden_state).squeeze(0)
-            bypass_latent = latent[..., bypass_start:bypass_end]
-            if masks is not None:
-                bypass_latent = unpad_trajectories(bypass_latent, masks)
-            return torch.cat((recurrent_latent, bypass_latent), dim=-1)
         elif self.structure == "split_cnn_gru_mlp":
             assert self.recurrent_obs_range is not None
             assert self.cnn_obs_range is not None
@@ -330,7 +287,6 @@ class _TorchGRUModel(nn.Module):
         self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
         self.encoder = copy.deepcopy(model.encoder) if model.structure == "mlp_gru" else nn.Identity()
         self.recurrent_obs_start, self.recurrent_obs_end = model.recurrent_obs_range or (0, model.obs_dim)
-        self.bypass_obs_start, self.bypass_obs_end = model.bypass_obs_range or (0, 0)
         self.cnn_obs_start, self.cnn_obs_end = model.cnn_obs_range or (0, 0)
         self.cnn_time, self.cnn_features = model.cnn_obs_shape or (0, 0)
         self.cnn_channels = list(model.cnn_channels or ())
@@ -356,9 +312,6 @@ class _TorchGRUModel(nn.Module):
         if self.structure == "mlp_gru":
             x = self.encoder(x)
             bypass = x[..., :0]
-        elif self.structure == "split_gru_mlp":
-            bypass = x[..., self.bypass_obs_start : self.bypass_obs_end]
-            x = x[..., self.recurrent_obs_start : self.recurrent_obs_end]
         elif self.structure == "split_cnn_gru_mlp":
             bypass = x[..., self.shortcut_obs_start : self.shortcut_obs_end]
             cnn = x[..., self.cnn_obs_start : self.cnn_obs_end]
@@ -369,9 +322,7 @@ class _TorchGRUModel(nn.Module):
         x, h = self.rnn(x.unsqueeze(0), self.hidden_state)
         self.hidden_state[:] = h  # type: ignore
         x = x.squeeze(0)
-        if self.structure == "split_gru_mlp":
-            x = torch.cat((x, bypass), dim=-1)
-        elif self.structure == "split_cnn_gru_mlp":
+        if self.structure == "split_cnn_gru_mlp":
             x = torch.cat((x, cnn, bypass), dim=-1)
         out = self.mlp(x)
         return self.deterministic_output(out)
@@ -391,7 +342,6 @@ class _TorchGRUModelWithExplicitState(nn.Module):
         self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
         self.encoder = copy.deepcopy(model.encoder) if model.structure == "mlp_gru" else nn.Identity()
         self.recurrent_obs_start, self.recurrent_obs_end = model.recurrent_obs_range or (0, model.obs_dim)
-        self.bypass_obs_start, self.bypass_obs_end = model.bypass_obs_range or (0, 0)
         self.cnn_obs_start, self.cnn_obs_end = model.cnn_obs_range or (0, 0)
         self.cnn_time, self.cnn_features = model.cnn_obs_shape or (0, 0)
         self.cnn_channels = list(model.cnn_channels or ())
@@ -411,9 +361,6 @@ class _TorchGRUModelWithExplicitState(nn.Module):
         if model.structure == "split_cnn_gru_mlp":
             self.format_version = 3
             self.fusion_order = "gru_hidden,cnn_latent,shortcut"
-        elif model.structure == "split_gru_mlp":
-            self.format_version = 2
-            self.fusion_order = "gru_hidden,bypass"
         else:
             self.format_version = 1
             self.fusion_order = ""
@@ -429,9 +376,6 @@ class _TorchGRUModelWithExplicitState(nn.Module):
         if self.structure == "mlp_gru":
             x = self.encoder(x)
             bypass = x[..., :0]
-        elif self.structure == "split_gru_mlp":
-            bypass = x[..., self.bypass_obs_start : self.bypass_obs_end]
-            x = x[..., self.recurrent_obs_start : self.recurrent_obs_end]
         elif self.structure == "split_cnn_gru_mlp":
             bypass = x[..., self.shortcut_obs_start : self.shortcut_obs_end]
             cnn = x[..., self.cnn_obs_start : self.cnn_obs_end]
@@ -441,9 +385,7 @@ class _TorchGRUModelWithExplicitState(nn.Module):
             bypass = x[..., :0]
         x, next_hidden_state = self.rnn(x.unsqueeze(0), hidden_state)
         x = x.squeeze(0)
-        if self.structure == "split_gru_mlp":
-            x = torch.cat((x, bypass), dim=-1)
-        elif self.structure == "split_cnn_gru_mlp":
+        if self.structure == "split_cnn_gru_mlp":
             x = torch.cat((x, cnn, bypass), dim=-1)
         actions = self.deterministic_output(self.mlp(x))
         return actions, next_hidden_state
@@ -459,7 +401,6 @@ class _TorchLSTMModel(nn.Module):
         self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
         self.encoder = copy.deepcopy(model.encoder) if model.structure == "mlp_gru" else nn.Identity()
         self.recurrent_obs_start, self.recurrent_obs_end = model.recurrent_obs_range or (0, model.obs_dim)
-        self.bypass_obs_start, self.bypass_obs_end = model.bypass_obs_range or (0, 0)
         self.rnn = copy.deepcopy(model.rnn.rnn)  # Access underlying torch module to avoid wrapper logic during export
         self.mlp = copy.deepcopy(model.mlp)
         if model.distribution is not None:
@@ -475,17 +416,12 @@ class _TorchLSTMModel(nn.Module):
         if self.structure == "mlp_gru":
             x = self.encoder(x)
             bypass = x[..., :0]
-        elif self.structure == "split_gru_mlp":
-            bypass = x[..., self.bypass_obs_start : self.bypass_obs_end]
-            x = x[..., self.recurrent_obs_start : self.recurrent_obs_end]
         else:
             bypass = x[..., :0]
         x, (h, c) = self.rnn(x.unsqueeze(0), (self.hidden_state, self.cell_state))
         self.hidden_state[:] = h  # type: ignore
         self.cell_state[:] = c  # type: ignore
         x = x.squeeze(0)
-        if self.structure == "split_gru_mlp":
-            x = torch.cat((x, bypass), dim=-1)
         out = self.mlp(x)
         return self.deterministic_output(out)
 
@@ -509,7 +445,6 @@ class _OnnxRNNModel(nn.Module):
         self.obs_normalizer = copy.deepcopy(model.obs_normalizer)
         self.encoder = copy.deepcopy(model.encoder) if model.structure == "mlp_gru" else nn.Identity()
         self.recurrent_obs_start, self.recurrent_obs_end = model.recurrent_obs_range or (0, model.obs_dim)
-        self.bypass_obs_start, self.bypass_obs_end = model.bypass_obs_range or (0, 0)
         self.cnn_obs_start, self.cnn_obs_end = model.cnn_obs_range or (0, 0)
         self.cnn_time, self.cnn_features = model.cnn_obs_shape or (0, 0)
         self.shortcut_obs_start, self.shortcut_obs_end = model.shortcut_obs_range or (0, 0)
@@ -544,9 +479,6 @@ class _OnnxRNNModel(nn.Module):
         if self.structure == "mlp_gru":
             x = self.encoder(x)
             bypass = x[..., :0]
-        elif self.structure == "split_gru_mlp":
-            bypass = x[..., self.bypass_obs_start : self.bypass_obs_end]
-            x = x[..., self.recurrent_obs_start : self.recurrent_obs_end]
         elif self.structure == "split_cnn_gru_mlp":
             bypass = x[..., self.shortcut_obs_start : self.shortcut_obs_end]
             cnn = x[..., self.cnn_obs_start : self.cnn_obs_end]
@@ -558,9 +490,7 @@ class _OnnxRNNModel(nn.Module):
         if self.rnn_type == "lstm":
             x, (h, c) = self.rnn(x.unsqueeze(0), (h_in, c_in))
             x = x.squeeze(0)
-            if self.structure == "split_gru_mlp":
-                x = torch.cat((x, bypass), dim=-1)
-            elif self.structure == "split_cnn_gru_mlp":
+            if self.structure == "split_cnn_gru_mlp":
                 x = torch.cat((x, cnn, bypass), dim=-1)
             out = self.mlp(x)
             out = self.deterministic_output(out)
@@ -568,9 +498,7 @@ class _OnnxRNNModel(nn.Module):
         else:
             x, h = self.rnn(x.unsqueeze(0), h_in)
             x = x.squeeze(0)
-            if self.structure == "split_gru_mlp":
-                x = torch.cat((x, bypass), dim=-1)
-            elif self.structure == "split_cnn_gru_mlp":
+            if self.structure == "split_cnn_gru_mlp":
                 x = torch.cat((x, cnn, bypass), dim=-1)
             out = self.mlp(x)
             out = self.deterministic_output(out)

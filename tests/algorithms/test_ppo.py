@@ -197,7 +197,7 @@ class TestGAEComputation:
         assert abs(adv.std().item() - 1.0) < 0.1, "Advantages should be unit-std"
 
 
-def test_recurrent_split_actor_updates_with_feedforward_critic() -> None:
+def test_recurrent_actor_updates_with_feedforward_critic() -> None:
     """PPO should align padded actor trajectories with an unpadded MLP critic."""
     obs = make_obs(NUM_ENVS, OBS_DIM)
     obs_groups = {"actor": ["policy"], "critic": ["policy"]}
@@ -211,9 +211,7 @@ def test_recurrent_split_actor_updates_with_feedforward_critic() -> None:
         rnn_type="gru",
         rnn_hidden_dim=16,
         rnn_num_layers=1,
-        structure="split_gru_mlp",
-        recurrent_obs_range=(2, 8),
-        bypass_obs_range=(0, 4),
+        structure="gru_mlp",
         distribution_cfg={"class_name": "GaussianDistribution", "init_std": 1.0, "std_type": "scalar"},
     )
     critic = _make_critic(obs, obs_groups)

@@ -220,29 +220,6 @@ class TestRNNModelStructure:
         assert model.rnn.rnn.input_size == OBS_DIM
         assert model.mlp[0].in_features == 16
 
-    def test_split_gru_mlp_fuses_recurrent_and_overlapping_bypass_slices(self) -> None:
-        """The split structure should preserve the direct slice while recurrently encoding its overlap."""
-        model, obs = _make_rnn_model(
-            structure="split_gru_mlp",
-            recurrent_obs_range=(2, 8),
-            bypass_obs_range=(0, 4),
-            hidden_dims=[32, 16],
-        )
-
-        assert model.rnn.rnn.input_size == 6
-        assert model.mlp[0].in_features == 20
-
-        observations = obs["policy"]
-        hidden = torch.zeros(1, NUM_ENVS, 16)
-        model.reset(hidden_state=hidden.clone())
-        with torch.no_grad():
-            recurrent, expected_hidden = model.rnn.rnn(observations[:, 2:8].unsqueeze(0), hidden)
-            expected = model.mlp(torch.cat((recurrent.squeeze(0), observations[:, 0:4]), dim=-1))
-            actual = model(obs)
-
-        assert torch.allclose(actual, expected)
-        assert torch.allclose(model.get_hidden_state(), expected_hidden)
-
     def test_split_cnn_gru_mlp_matches_am_pose_contract(self) -> None:
         """The AM Pose temporal encoder must preserve all three branch widths and parameter count."""
         model, obs = _make_cnn_gru_model()
@@ -295,33 +272,6 @@ class TestRNNModelStructure:
 
         assert output.shape == (5, 2, NUM_ACTIONS)
         assert torch.all(torch.isfinite(output))
-
-    @pytest.mark.parametrize(
-        ("kwargs", "message"),
-        [
-            ({"recurrent_obs_range": (2, 8)}, "bypass_obs_range must contain"),
-            (
-                {"recurrent_obs_range": (2, 9), "bypass_obs_range": (0, 4)},
-                "must fit within",
-            ),
-            (
-                {"recurrent_obs_range": (2, 8), "bypass_obs_range": (0, 4), "rnn_type": "lstm"},
-                "only supports GRU",
-            ),
-        ],
-    )
-    def test_invalid_split_structure_configuration_is_rejected(self, kwargs: dict, message: str) -> None:
-        """Incomplete, out-of-bounds, and non-GRU split configurations should fail early."""
-        defaults = {
-            "structure": "split_gru_mlp",
-            "recurrent_obs_range": (2, 8),
-            "bypass_obs_range": (0, 4),
-        }
-        defaults.update(kwargs)
-        if "bypass_obs_range" not in kwargs and "recurrent_obs_range" in kwargs:
-            defaults.pop("bypass_obs_range")
-        with pytest.raises(ValueError, match=message):
-            _make_rnn_model(**defaults)
 
     def test_invalid_structure_is_rejected(self) -> None:
         """Unknown RNN/MLP structures should fail during construction."""
@@ -473,30 +423,6 @@ class TestRNNModelExplicitStateJITExport:
         with pytest.raises(NotImplementedError, match="only supports GRU"):
             model.as_jit_with_explicit_state()
 
-    def test_split_export_matches_model_and_records_v2_contract(self) -> None:
-        """Explicit-state split exports should preserve the fusion and publish its observation slices."""
-        model, obs = _make_rnn_model(
-            structure="split_gru_mlp",
-            recurrent_obs_range=(2, 8),
-            bypass_obs_range=(0, 4),
-            hidden_dims=[32, 16],
-        )
-        exported = torch.jit.script(model.as_jit_with_explicit_state())
-        hidden = torch.zeros(1, NUM_ENVS, 16)
-        model.reset(hidden_state=hidden.clone())
-        expected = model(obs).detach()
-
-        actions, next_hidden = exported(obs["policy"], hidden)
-
-        assert torch.allclose(actions, expected, atol=1e-5)
-        assert torch.allclose(next_hidden, model.get_hidden_state(), atol=1e-5)
-        assert exported.format_version == 2
-        assert exported.recurrent_obs_start == 2
-        assert exported.recurrent_obs_end == 8
-        assert exported.bypass_obs_start == 0
-        assert exported.bypass_obs_end == 4
-        assert exported.fusion_order == "gru_hidden,bypass"
-
     def test_cnn_split_export_matches_model_and_records_v3_contract(self) -> None:
         """Explicit-state v3 export must retain CNN and shortcut metadata and numerics."""
         model, obs = _make_cnn_gru_model()
@@ -560,45 +486,6 @@ class TestRNNModelONNXExport:
 
             assert [i.name for i in loaded.graph.input] == onnx_model.input_names
             assert [o.name for o in loaded.graph.output] == onnx_model.output_names
-
-    def test_split_gru_mlp_onnx_export_preserves_direct_bypass(self) -> None:
-        """The ONNX wrapper must reproduce the split actor before graph serialization."""
-        obs = make_obs(1, OBS_DIM)
-        model = RNNModel(
-            obs,
-            {"actor": ["policy"]},
-            "actor",
-            NUM_ACTIONS,
-            hidden_dims=[32, 16],
-            activation="elu",
-            rnn_type="gru",
-            rnn_hidden_dim=16,
-            rnn_num_layers=1,
-            structure="split_gru_mlp",
-            recurrent_obs_range=(2, 8),
-            bypass_obs_range=(0, 4),
-            distribution_cfg={"class_name": "GaussianDistribution", "init_std": 1.0, "std_type": "scalar"},
-        ).eval()
-        exported = model.as_onnx(verbose=False).eval()
-        inputs = exported.get_dummy_inputs()
-
-        model.reset(hidden_state=inputs[1].clone())
-        expected = model(obs, stochastic_output=False).detach()
-        actual, next_hidden, _ = exported(obs["policy"], inputs[1])
-
-        assert torch.allclose(actual, expected, atol=1.0e-5)
-        assert torch.allclose(next_hidden, model.get_hidden_state(), atol=1.0e-5)
-        with tempfile.NamedTemporaryFile(suffix=".onnx") as file:
-            torch.onnx.export(
-                exported,
-                inputs,
-                file.name,
-                export_params=True,
-                opset_version=18,
-                input_names=exported.input_names,
-                output_names=exported.output_names,
-            )
-            onnx.checker.check_model(onnx.load(file.name))
 
     def test_split_cnn_gru_mlp_onnx_export_matches_model(self) -> None:
         """The ONNX wrapper must preserve CNN, GRU, and shortcut fusion."""
