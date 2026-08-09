@@ -75,6 +75,7 @@ class RolloutStorage:
             self,
             observations: TensorDict | None = None,
             actions: torch.Tensor | None = None,
+            trajectory_actions: torch.Tensor | None = None,
             values: torch.Tensor | None = None,
             advantages: torch.Tensor | None = None,
             returns: torch.Tensor | None = None,
@@ -92,6 +93,9 @@ class RolloutStorage:
             # For reinforcement learning
             self.actions: torch.Tensor | None = actions
             """Batch of actions."""
+
+            self.trajectory_actions: torch.Tensor | None = trajectory_actions
+            """Padded action trajectories aligned with recurrent observation trajectories."""
 
             self.values: torch.Tensor | None = values
             """Batch of value estimates (RL only)."""
@@ -265,6 +269,7 @@ class RolloutStorage:
         if self.training_type != "rl":
             raise ValueError("This function is only available for reinforcement learning training.")
         padded_obs_trajectories, trajectory_masks = split_and_pad_trajectories(self.observations, self.dones)
+        padded_action_trajectories, _ = split_and_pad_trajectories(self.actions, self.dones)
         mini_batch_size = self.num_envs // num_mini_batches
 
         for ep in range(num_epochs):
@@ -317,6 +322,7 @@ class RolloutStorage:
                 yield RolloutStorage.Batch(
                     observations=padded_obs_trajectories[:, first_traj:last_traj],  # type: ignore
                     actions=self.actions[:, start:stop],
+                    trajectory_actions=padded_action_trajectories[:, first_traj:last_traj],
                     values=self.values[:, start:stop],
                     advantages=self.advantages[:, start:stop],
                     returns=self.returns[:, start:stop],

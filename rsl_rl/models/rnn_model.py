@@ -7,11 +7,10 @@
 from __future__ import annotations
 
 import copy
-from typing import Literal
-
 import torch
 import torch.nn as nn
 from tensordict import TensorDict
+from typing import Literal
 
 from rsl_rl.models.mlp_model import MLPModel
 from rsl_rl.modules import MLP, RNN, HiddenState
@@ -43,7 +42,7 @@ class RNNModel(MLPModel):
         rnn_type: str = "lstm",
         rnn_hidden_dim: int = 256,
         rnn_num_layers: int = 1,
-        structure: Literal["gru_mlp", "mlp_gru", "split_cnn_gru_mlp"] = "gru_mlp",
+        structure: Literal["gru_mlp", "mlp_gru", "split_cnn_gru_mlp", "split_cnn_jepa_gru_mlp"] = "gru_mlp",
         recurrent_obs_range: tuple[int, int] | list[int] | None = None,
         cnn_obs_range: tuple[int, int] | list[int] | None = None,
         cnn_obs_shape: tuple[int, int] | list[int] | None = None,
@@ -51,6 +50,10 @@ class RNNModel(MLPModel):
         cnn_kernel_size: int | None = None,
         cnn_output_dim: int | None = None,
         shortcut_obs_range: tuple[int, int] | list[int] | None = None,
+        jepa_state_obs_range: tuple[int, int] | list[int] | None = None,
+        jepa_previous_action_obs_range: tuple[int, int] | list[int] | None = None,
+        jepa_latent_dim: int = 32,
+        jepa_prediction_steps: tuple[int, ...] | list[int] | None = None,
     ) -> None:
         """Initialize the RNN-based model.
 
@@ -76,12 +79,17 @@ class RNNModel(MLPModel):
             cnn_kernel_size: Shared kernel size of the valid Conv1d layers.
             cnn_output_dim: Dimension of the linear projection after the flattened convolutions.
             shortcut_obs_range: Half-open direct-feedback range concatenated at the fusion layer.
+            jepa_state_obs_range: Half-open physical-state range encoded by the online and target encoders.
+            jepa_previous_action_obs_range: Half-open previous-action range concatenated with the online latent.
+            jepa_latent_dim: Dimension of the JEPA physical-state latent.
+            jepa_prediction_steps: Positive rollout step offsets used by the latent predictor.
         """
-        if structure not in {"gru_mlp", "mlp_gru", "split_cnn_gru_mlp"}:
+        split_structures = {"split_cnn_gru_mlp", "split_cnn_jepa_gru_mlp"}
+        if structure not in {"gru_mlp", "mlp_gru", *split_structures}:
             raise ValueError(f"Unsupported structure: {structure}")
-        if structure == "split_cnn_gru_mlp":
+        if structure in split_structures:
             if rnn_type.lower() != "gru":
-                raise ValueError("split_cnn_gru_mlp only supports GRU recurrent modules.")
+                raise ValueError("Split CNN recurrent structures only support GRU modules.")
             recurrent_obs_range = self._validate_obs_range("recurrent_obs_range", recurrent_obs_range)
             cnn_obs_range = self._validate_obs_range("cnn_obs_range", cnn_obs_range)
             shortcut_obs_range = self._validate_obs_range("shortcut_obs_range", shortcut_obs_range)
@@ -102,6 +110,18 @@ class RNNModel(MLPModel):
                 raise ValueError("CNN kernel stack leaves no temporal output samples.")
             if cnn_output_dim is None or cnn_output_dim <= 0:
                 raise ValueError("cnn_output_dim must be positive.")
+            if structure == "split_cnn_jepa_gru_mlp":
+                jepa_state_obs_range = self._validate_obs_range("jepa_state_obs_range", jepa_state_obs_range)
+                jepa_previous_action_obs_range = self._validate_obs_range(
+                    "jepa_previous_action_obs_range", jepa_previous_action_obs_range
+                )
+                if jepa_latent_dim <= 0:
+                    raise ValueError("jepa_latent_dim must be positive.")
+                if not jepa_prediction_steps or any(int(step) <= 0 for step in jepa_prediction_steps):
+                    raise ValueError("jepa_prediction_steps must contain positive step offsets.")
+                jepa_prediction_steps = tuple(sorted({int(step) for step in jepa_prediction_steps}))
+                if jepa_previous_action_obs_range[1] - jepa_previous_action_obs_range[0] != output_dim:
+                    raise ValueError("The previous-action observation range must match the policy action dimension.")
         elif any(
             value is not None
             for value in (
@@ -112,9 +132,14 @@ class RNNModel(MLPModel):
                 cnn_kernel_size,
                 cnn_output_dim,
                 shortcut_obs_range,
+                jepa_state_obs_range,
+                jepa_previous_action_obs_range,
+                jepa_prediction_steps,
             )
         ):
             raise ValueError("Observation branch settings are only valid with a split network structure.")
+        elif jepa_latent_dim != 32:
+            raise ValueError("jepa_latent_dim is only valid with split_cnn_jepa_gru_mlp.")
         self.structure = structure
         self.recurrent_obs_range = recurrent_obs_range
         self.cnn_obs_range = cnn_obs_range
@@ -123,10 +148,16 @@ class RNNModel(MLPModel):
         self.cnn_kernel_size = cnn_kernel_size
         self.cnn_output_dim = cnn_output_dim
         self.shortcut_obs_range = shortcut_obs_range
-        if structure == "split_cnn_gru_mlp":
+        self.jepa_state_obs_range = jepa_state_obs_range
+        self.jepa_previous_action_obs_range = jepa_previous_action_obs_range
+        self.jepa_latent_dim = jepa_latent_dim
+        self.jepa_prediction_steps = jepa_prediction_steps
+        if structure in split_structures:
             assert shortcut_obs_range is not None
             assert cnn_output_dim is not None
             self.latent_dim = rnn_hidden_dim + cnn_output_dim + shortcut_obs_range[1] - shortcut_obs_range[0]
+            if structure == "split_cnn_jepa_gru_mlp":
+                self.latent_dim += jepa_latent_dim
         else:
             self.latent_dim = rnn_hidden_dim
 
@@ -143,11 +174,15 @@ class RNNModel(MLPModel):
         )
         self.output_dim = output_dim
 
-        if self.structure == "split_cnn_gru_mlp":
+        if self.structure in split_structures:
             assert recurrent_obs_range is not None
             assert cnn_obs_range is not None
             assert shortcut_obs_range is not None
-            ranges = (recurrent_obs_range, cnn_obs_range, shortcut_obs_range)
+            ranges = [recurrent_obs_range, cnn_obs_range, shortcut_obs_range]
+            if self.structure == "split_cnn_jepa_gru_mlp":
+                assert jepa_state_obs_range is not None
+                assert jepa_previous_action_obs_range is not None
+                ranges.extend((jepa_state_obs_range, jepa_previous_action_obs_range))
             if any(obs_range[1] > self.obs_dim for obs_range in ranges):
                 raise ValueError(
                     "split_cnn_gru_mlp observation ranges must fit within the concatenated observation dimension "
@@ -176,13 +211,17 @@ class RNNModel(MLPModel):
                 self.distribution.init_mlp_weights(self.mlp)
         else:
             assert recurrent_obs_range is not None
+            rnn_input_dim = recurrent_obs_range[1] - recurrent_obs_range[0]
+            if self.structure == "split_cnn_jepa_gru_mlp":
+                assert jepa_previous_action_obs_range is not None
+                rnn_input_dim = jepa_latent_dim + jepa_previous_action_obs_range[1] - jepa_previous_action_obs_range[0]
             self.rnn = RNN(
-                recurrent_obs_range[1] - recurrent_obs_range[0],
+                rnn_input_dim,
                 rnn_hidden_dim,
                 rnn_num_layers,
                 rnn_type,
             )
-            if self.structure == "split_cnn_gru_mlp":
+            if self.structure in split_structures:
                 assert cnn_obs_shape is not None
                 assert cnn_channels is not None
                 assert cnn_kernel_size is not None
@@ -197,6 +236,24 @@ class RNNModel(MLPModel):
                 final_length = cnn_obs_shape[0] - len(cnn_channels) * (cnn_kernel_size - 1)
                 layers.extend((nn.Flatten(), nn.Linear(cnn_channels[-1] * final_length, cnn_output_dim)))
                 self.cnn_encoder = nn.Sequential(*layers)
+            if self.structure == "split_cnn_jepa_gru_mlp":
+                assert jepa_state_obs_range is not None
+                state_dim = jepa_state_obs_range[1] - jepa_state_obs_range[0]
+                self.jepa_online_encoder = nn.Sequential(
+                    nn.Linear(state_dim, jepa_latent_dim),
+                    copy.deepcopy(resolve_nn_activation(activation)),
+                    nn.Linear(jepa_latent_dim, jepa_latent_dim),
+                    nn.LayerNorm(jepa_latent_dim),
+                )
+                self.jepa_target_encoder = copy.deepcopy(self.jepa_online_encoder)
+                self.jepa_target_encoder.requires_grad_(False)
+                self.jepa_context_projection = nn.Linear(rnn_hidden_dim, jepa_latent_dim)
+                self.jepa_transition_predictor = nn.Sequential(
+                    nn.Linear(jepa_latent_dim + output_dim, 64),
+                    copy.deepcopy(resolve_nn_activation(activation)),
+                    nn.Linear(64, jepa_latent_dim),
+                )
+                self._jepa_training_cache: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None
 
     def get_latent(
         self, obs: TensorDict, masks: torch.Tensor | None = None, hidden_state: HiddenState = None
@@ -206,15 +263,32 @@ class RNNModel(MLPModel):
         latent = super().get_latent(obs)
         if self.structure == "mlp_gru":
             latent = self.encoder(latent)
-        elif self.structure == "split_cnn_gru_mlp":
+        elif self.structure == "split_cnn_gru_mlp" or self.structure == "split_cnn_jepa_gru_mlp":
             assert self.recurrent_obs_range is not None
             assert self.cnn_obs_range is not None
             assert self.cnn_obs_shape is not None
             assert self.shortcut_obs_range is not None
-            recurrent_start, recurrent_end = self.recurrent_obs_range
             cnn_start, cnn_end = self.cnn_obs_range
             shortcut_start, shortcut_end = self.shortcut_obs_range
-            recurrent_latent = self.rnn(latent[..., recurrent_start:recurrent_end], masks, hidden_state).squeeze(0)
+            if self.structure == "split_cnn_jepa_gru_mlp":
+                assert self.jepa_state_obs_range is not None
+                assert self.jepa_previous_action_obs_range is not None
+                state_start, state_end = self.jepa_state_obs_range
+                action_start, action_end = self.jepa_previous_action_obs_range
+                physical_state = latent[..., state_start:state_end]
+                online_latent = self.jepa_online_encoder(physical_state)
+                recurrent_input = torch.cat((online_latent, latent[..., action_start:action_end]), dim=-1)
+                if masks is None:
+                    recurrent_latent = self.rnn(recurrent_input, None, hidden_state).squeeze(0)
+                else:
+                    if hidden_state is None:
+                        raise ValueError("Hidden states are required for recurrent JEPA updates.")
+                    padded_hidden, _ = self.rnn.rnn(recurrent_input, hidden_state)
+                    recurrent_latent = unpad_trajectories(padded_hidden, masks)
+                    self._jepa_training_cache = (physical_state, online_latent, padded_hidden, masks)
+            else:
+                recurrent_start, recurrent_end = self.recurrent_obs_range
+                recurrent_latent = self.rnn(latent[..., recurrent_start:recurrent_end], masks, hidden_state).squeeze(0)
             cnn_observations = latent[..., cnn_start:cnn_end]
             leading_shape = cnn_observations.shape[:-1]
             cnn_latent = self.cnn_encoder(
@@ -224,15 +298,60 @@ class RNNModel(MLPModel):
             if masks is not None:
                 cnn_latent = unpad_trajectories(cnn_latent, masks)
                 shortcut_latent = unpad_trajectories(shortcut_latent, masks)
+                if self.structure == "split_cnn_jepa_gru_mlp":
+                    online_latent = unpad_trajectories(online_latent, masks)
+            if self.structure == "split_cnn_jepa_gru_mlp":
+                return torch.cat((online_latent, recurrent_latent, cnn_latent, shortcut_latent), dim=-1)
             return torch.cat((recurrent_latent, cnn_latent, shortcut_latent), dim=-1)
         # Pass through the RNN
         latent = self.rnn(latent, masks, hidden_state).squeeze(0)
         return latent
 
+    def compute_jepa_loss(
+        self, trajectory_actions: torch.Tensor
+    ) -> tuple[torch.Tensor, dict[int, torch.Tensor], torch.Tensor]:
+        """Predict future physical-state latents from recurrent context and sampled actions."""
+        if self.structure != "split_cnn_jepa_gru_mlp" or self._jepa_training_cache is None:
+            raise RuntimeError("JEPA loss requires a preceding padded forward pass through a JEPA actor.")
+        physical_state, online_latent, hidden, masks = self._jepa_training_cache
+        self._jepa_training_cache = None
+        if trajectory_actions.shape[:2] != masks.shape:
+            raise ValueError("Padded action trajectories must align with the recurrent trajectory masks.")
+
+        target_latent = self.jepa_target_encoder(physical_state).detach()
+        prediction = self.jepa_context_projection(hidden)
+        losses: dict[int, torch.Tensor] = {}
+        for step in range(1, max(self.jepa_prediction_steps) + 1):
+            prediction = self.jepa_transition_predictor(
+                torch.cat((prediction[:-1], trajectory_actions[step - 1 : -1]), dim=-1)
+            )
+            if step not in self.jepa_prediction_steps:
+                continue
+            valid = masks[:-step] & masks[step:]
+            if valid.any():
+                cosine = torch.nn.functional.cosine_similarity(prediction[valid], target_latent[step:][valid], dim=-1)
+                losses[step] = 1.0 - cosine.mean()
+            else:
+                losses[step] = online_latent.sum() * 0.0
+
+        valid_online_latent = online_latent[masks]
+        latent_std = valid_online_latent.std(dim=0, unbiased=False).mean()
+        return torch.stack(tuple(losses.values())).mean(), losses, latent_std
+
+    @torch.no_grad()
+    def update_jepa_target(self, momentum: float) -> None:
+        """Update the target encoder with an exponential moving average."""
+        if self.structure != "split_cnn_jepa_gru_mlp":
+            raise RuntimeError("Only JEPA actors have a target encoder.")
+        if not 0.0 <= momentum < 1.0:
+            raise ValueError(f"JEPA target momentum must be in [0, 1), got {momentum}.")
+        for target, online in zip(
+            self.jepa_target_encoder.parameters(), self.jepa_online_encoder.parameters(), strict=True
+        ):
+            target.lerp_(online, 1.0 - momentum)
+
     @staticmethod
-    def _validate_obs_range(
-        name: str, obs_range: tuple[int, int] | list[int] | None
-    ) -> tuple[int, int]:
+    def _validate_obs_range(name: str, obs_range: tuple[int, int] | list[int] | None) -> tuple[int, int]:
         """Validate and normalize one half-open observation range."""
         if obs_range is None or len(obs_range) != 2:
             raise ValueError(f"{name} must contain exactly two indices for a split network structure.")
@@ -293,8 +412,17 @@ class _TorchGRUModel(nn.Module):
         self.cnn_kernel_size = int(model.cnn_kernel_size or 0)
         self.cnn_output_dim = int(model.cnn_output_dim or 0)
         self.shortcut_obs_start, self.shortcut_obs_end = model.shortcut_obs_range or (0, 0)
+        self.jepa_state_obs_start, self.jepa_state_obs_end = model.jepa_state_obs_range or (0, 0)
+        self.jepa_previous_action_obs_start, self.jepa_previous_action_obs_end = (
+            model.jepa_previous_action_obs_range or (0, 0)
+        )
+        self.jepa_online_encoder = (
+            copy.deepcopy(model.jepa_online_encoder) if model.structure == "split_cnn_jepa_gru_mlp" else nn.Identity()
+        )
         self.cnn_encoder = (
-            copy.deepcopy(model.cnn_encoder) if model.structure == "split_cnn_gru_mlp" else nn.Identity()
+            copy.deepcopy(model.cnn_encoder)
+            if model.structure in {"split_cnn_gru_mlp", "split_cnn_jepa_gru_mlp"}
+            else nn.Identity()
         )
         self.rnn = copy.deepcopy(model.rnn.rnn)  # Access underlying torch module to avoid wrapper logic during export
         self.mlp = copy.deepcopy(model.mlp)
@@ -309,14 +437,25 @@ class _TorchGRUModel(nn.Module):
         """Run one GRU inference step and update hidden states."""
         x = self.obs_normalizer(x)
         cnn = x[..., :0]
+        online_latent = x[..., :0]
         if self.structure == "mlp_gru":
             x = self.encoder(x)
             bypass = x[..., :0]
-        elif self.structure == "split_cnn_gru_mlp":
+        elif self.structure == "split_cnn_gru_mlp" or self.structure == "split_cnn_jepa_gru_mlp":
             bypass = x[..., self.shortcut_obs_start : self.shortcut_obs_end]
             cnn = x[..., self.cnn_obs_start : self.cnn_obs_end]
             cnn = self.cnn_encoder(cnn.reshape(x.shape[0], self.cnn_time, self.cnn_features).transpose(1, 2))
-            x = x[..., self.recurrent_obs_start : self.recurrent_obs_end]
+            if self.structure == "split_cnn_jepa_gru_mlp":
+                online_latent = self.jepa_online_encoder(x[..., self.jepa_state_obs_start : self.jepa_state_obs_end])
+                x = torch.cat(
+                    (
+                        online_latent,
+                        x[..., self.jepa_previous_action_obs_start : self.jepa_previous_action_obs_end],
+                    ),
+                    dim=-1,
+                )
+            else:
+                x = x[..., self.recurrent_obs_start : self.recurrent_obs_end]
         else:
             bypass = x[..., :0]
         x, h = self.rnn(x.unsqueeze(0), self.hidden_state)
@@ -324,6 +463,8 @@ class _TorchGRUModel(nn.Module):
         x = x.squeeze(0)
         if self.structure == "split_cnn_gru_mlp":
             x = torch.cat((x, cnn, bypass), dim=-1)
+        elif self.structure == "split_cnn_jepa_gru_mlp":
+            x = torch.cat((online_latent, x, cnn, bypass), dim=-1)
         out = self.mlp(x)
         return self.deterministic_output(out)
 
@@ -348,8 +489,17 @@ class _TorchGRUModelWithExplicitState(nn.Module):
         self.cnn_kernel_size = int(model.cnn_kernel_size or 0)
         self.cnn_output_dim = int(model.cnn_output_dim or 0)
         self.shortcut_obs_start, self.shortcut_obs_end = model.shortcut_obs_range or (0, 0)
+        self.jepa_state_obs_start, self.jepa_state_obs_end = model.jepa_state_obs_range or (0, 0)
+        self.jepa_previous_action_obs_start, self.jepa_previous_action_obs_end = (
+            model.jepa_previous_action_obs_range or (0, 0)
+        )
+        self.jepa_online_encoder = (
+            copy.deepcopy(model.jepa_online_encoder) if model.structure == "split_cnn_jepa_gru_mlp" else nn.Identity()
+        )
         self.cnn_encoder = (
-            copy.deepcopy(model.cnn_encoder) if model.structure == "split_cnn_gru_mlp" else nn.Identity()
+            copy.deepcopy(model.cnn_encoder)
+            if model.structure in {"split_cnn_gru_mlp", "split_cnn_jepa_gru_mlp"}
+            else nn.Identity()
         )
         self.rnn = copy.deepcopy(model.rnn.rnn)
         self.mlp = copy.deepcopy(model.mlp)
@@ -358,7 +508,10 @@ class _TorchGRUModelWithExplicitState(nn.Module):
         else:
             self.deterministic_output = nn.Identity()
 
-        if model.structure == "split_cnn_gru_mlp":
+        if model.structure == "split_cnn_jepa_gru_mlp":
+            self.format_version = 4
+            self.fusion_order = "online_latent,gru_hidden,cnn_latent,shortcut"
+        elif model.structure == "split_cnn_gru_mlp":
             self.format_version = 3
             self.fusion_order = "gru_hidden,cnn_latent,shortcut"
         else:
@@ -373,20 +526,33 @@ class _TorchGRUModelWithExplicitState(nn.Module):
         """Run one deterministic inference step with explicit GRU state."""
         x = self.obs_normalizer(observations)
         cnn = x[..., :0]
+        online_latent = x[..., :0]
         if self.structure == "mlp_gru":
             x = self.encoder(x)
             bypass = x[..., :0]
-        elif self.structure == "split_cnn_gru_mlp":
+        elif self.structure == "split_cnn_gru_mlp" or self.structure == "split_cnn_jepa_gru_mlp":
             bypass = x[..., self.shortcut_obs_start : self.shortcut_obs_end]
             cnn = x[..., self.cnn_obs_start : self.cnn_obs_end]
             cnn = self.cnn_encoder(cnn.reshape(x.shape[0], self.cnn_time, self.cnn_features).transpose(1, 2))
-            x = x[..., self.recurrent_obs_start : self.recurrent_obs_end]
+            if self.structure == "split_cnn_jepa_gru_mlp":
+                online_latent = self.jepa_online_encoder(x[..., self.jepa_state_obs_start : self.jepa_state_obs_end])
+                x = torch.cat(
+                    (
+                        online_latent,
+                        x[..., self.jepa_previous_action_obs_start : self.jepa_previous_action_obs_end],
+                    ),
+                    dim=-1,
+                )
+            else:
+                x = x[..., self.recurrent_obs_start : self.recurrent_obs_end]
         else:
             bypass = x[..., :0]
         x, next_hidden_state = self.rnn(x.unsqueeze(0), hidden_state)
         x = x.squeeze(0)
         if self.structure == "split_cnn_gru_mlp":
             x = torch.cat((x, cnn, bypass), dim=-1)
+        elif self.structure == "split_cnn_jepa_gru_mlp":
+            x = torch.cat((online_latent, x, cnn, bypass), dim=-1)
         actions = self.deterministic_output(self.mlp(x))
         return actions, next_hidden_state
 
@@ -415,9 +581,6 @@ class _TorchLSTMModel(nn.Module):
         x = self.obs_normalizer(x)
         if self.structure == "mlp_gru":
             x = self.encoder(x)
-            bypass = x[..., :0]
-        else:
-            bypass = x[..., :0]
         x, (h, c) = self.rnn(x.unsqueeze(0), (self.hidden_state, self.cell_state))
         self.hidden_state[:] = h  # type: ignore
         self.cell_state[:] = c  # type: ignore
@@ -448,8 +611,17 @@ class _OnnxRNNModel(nn.Module):
         self.cnn_obs_start, self.cnn_obs_end = model.cnn_obs_range or (0, 0)
         self.cnn_time, self.cnn_features = model.cnn_obs_shape or (0, 0)
         self.shortcut_obs_start, self.shortcut_obs_end = model.shortcut_obs_range or (0, 0)
+        self.jepa_state_obs_start, self.jepa_state_obs_end = model.jepa_state_obs_range or (0, 0)
+        self.jepa_previous_action_obs_start, self.jepa_previous_action_obs_end = (
+            model.jepa_previous_action_obs_range or (0, 0)
+        )
+        self.jepa_online_encoder = (
+            copy.deepcopy(model.jepa_online_encoder) if model.structure == "split_cnn_jepa_gru_mlp" else nn.Identity()
+        )
         self.cnn_encoder = (
-            copy.deepcopy(model.cnn_encoder) if model.structure == "split_cnn_gru_mlp" else nn.Identity()
+            copy.deepcopy(model.cnn_encoder)
+            if model.structure in {"split_cnn_gru_mlp", "split_cnn_jepa_gru_mlp"}
+            else nn.Identity()
         )
         self.rnn = copy.deepcopy(model.rnn.rnn)  # Access underlying torch module to avoid wrapper logic during export
         self.mlp = copy.deepcopy(model.mlp)
@@ -476,14 +648,25 @@ class _OnnxRNNModel(nn.Module):
         """Run deterministic inference for ONNX export."""
         x = self.obs_normalizer(obs)
         cnn = x[..., :0]
+        online_latent = x[..., :0]
         if self.structure == "mlp_gru":
             x = self.encoder(x)
             bypass = x[..., :0]
-        elif self.structure == "split_cnn_gru_mlp":
+        elif self.structure == "split_cnn_gru_mlp" or self.structure == "split_cnn_jepa_gru_mlp":
             bypass = x[..., self.shortcut_obs_start : self.shortcut_obs_end]
             cnn = x[..., self.cnn_obs_start : self.cnn_obs_end]
             cnn = self.cnn_encoder(cnn.reshape(x.shape[0], self.cnn_time, self.cnn_features).transpose(1, 2))
-            x = x[..., self.recurrent_obs_start : self.recurrent_obs_end]
+            if self.structure == "split_cnn_jepa_gru_mlp":
+                online_latent = self.jepa_online_encoder(x[..., self.jepa_state_obs_start : self.jepa_state_obs_end])
+                x = torch.cat(
+                    (
+                        online_latent,
+                        x[..., self.jepa_previous_action_obs_start : self.jepa_previous_action_obs_end],
+                    ),
+                    dim=-1,
+                )
+            else:
+                x = x[..., self.recurrent_obs_start : self.recurrent_obs_end]
         else:
             bypass = x[..., :0]
 
@@ -492,6 +675,8 @@ class _OnnxRNNModel(nn.Module):
             x = x.squeeze(0)
             if self.structure == "split_cnn_gru_mlp":
                 x = torch.cat((x, cnn, bypass), dim=-1)
+            elif self.structure == "split_cnn_jepa_gru_mlp":
+                x = torch.cat((online_latent, x, cnn, bypass), dim=-1)
             out = self.mlp(x)
             out = self.deterministic_output(out)
             return out, h, c
@@ -500,6 +685,8 @@ class _OnnxRNNModel(nn.Module):
             x = x.squeeze(0)
             if self.structure == "split_cnn_gru_mlp":
                 x = torch.cat((x, cnn, bypass), dim=-1)
+            elif self.structure == "split_cnn_jepa_gru_mlp":
+                x = torch.cat((online_latent, x, cnn, bypass), dim=-1)
             out = self.mlp(x)
             out = self.deterministic_output(out)
             return out, h, None

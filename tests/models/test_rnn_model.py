@@ -8,11 +8,11 @@
 from __future__ import annotations
 
 import tempfile
+import torch
+from tensordict import TensorDict
 
 import onnx
 import pytest
-import torch
-from tensordict import TensorDict
 
 from rsl_rl.models import RNNModel
 from rsl_rl.utils import split_and_pad_trajectories
@@ -59,6 +59,36 @@ def _make_cnn_gru_model(observation_dim: int = 72) -> tuple[RNNModel, TensorDict
         cnn_kernel_size=3,
         cnn_output_dim=32,
         shortcut_obs_range=(55, 64),
+        distribution_cfg={"class_name": "BetaDistribution", "action_range": (0.0, 1.0)},
+    )
+    return model, obs
+
+
+def _make_jepa_gru_model(observation_dim: int = 72) -> tuple[RNNModel, TensorDict]:
+    state_end = observation_dim - 4
+    obs = make_obs(NUM_ENVS, observation_dim)
+    model = RNNModel(
+        obs,
+        {"actor": ["policy"]},
+        "actor",
+        NUM_ACTIONS,
+        hidden_dims=[48],
+        activation="elu",
+        rnn_type="gru",
+        rnn_hidden_dim=32,
+        rnn_num_layers=1,
+        structure="split_cnn_jepa_gru_mlp",
+        recurrent_obs_range=(55, observation_dim),
+        cnn_obs_range=(0, 55),
+        cnn_obs_shape=(11, 5),
+        cnn_channels=(32, 32, 8),
+        cnn_kernel_size=3,
+        cnn_output_dim=32,
+        shortcut_obs_range=(55, 64),
+        jepa_state_obs_range=(55, state_end),
+        jepa_previous_action_obs_range=(state_end, observation_dim),
+        jepa_latent_dim=32,
+        jepa_prediction_steps=(1, 2, 4),
         distribution_cfg={"class_name": "BetaDistribution", "action_range": (0.0, 1.0)},
     )
     return model, obs
@@ -273,6 +303,53 @@ class TestRNNModelStructure:
         assert output.shape == (5, 2, NUM_ACTIONS)
         assert torch.all(torch.isfinite(output))
 
+    def test_split_cnn_jepa_gru_mlp_matches_pose_contract(self) -> None:
+        """JEPA routing should preserve the public pose dimensions and branch widths."""
+        model, obs = _make_jepa_gru_model()
+
+        assert model.rnn.rnn.input_size == 36
+        assert model.mlp[0].in_features == 105
+        assert model.jepa_online_encoder[0].in_features == 13
+        assert model(obs).shape == (NUM_ENVS, NUM_ACTIONS)
+        assert all(not parameter.requires_grad for parameter in model.jepa_target_encoder.parameters())
+
+        dual_model, dual_obs = _make_jepa_gru_model(78)
+        assert dual_model.jepa_online_encoder[0].in_features == 19
+        assert dual_model(dual_obs).shape == (NUM_ENVS, NUM_ACTIONS)
+
+    def test_jepa_loss_is_action_conditioned_and_keeps_target_frozen(self) -> None:
+        """Future sampled actions should affect predictions without updating the target encoder."""
+        model, _ = _make_jepa_gru_model()
+        observations = TensorDict({"policy": torch.randn(8, 2, 72)}, batch_size=[8, 2])
+        masks = torch.ones(8, 2, dtype=torch.bool)
+        hidden = torch.zeros(1, 2, 32)
+
+        model(observations, masks=masks, hidden_state=hidden)
+        zero_action_loss, horizon_losses, latent_std = model.compute_jepa_loss(torch.zeros(8, 2, 4))
+        zero_action_loss.backward()
+
+        assert set(horizon_losses) == {1, 2, 4}
+        assert torch.isfinite(latent_std)
+        assert model.jepa_online_encoder[0].weight.grad is not None
+        assert model.rnn.rnn.weight_ih_l0.grad is not None
+        assert all(parameter.grad is None for parameter in model.jepa_target_encoder.parameters())
+
+        model.zero_grad(set_to_none=True)
+        model(observations, masks=masks, hidden_state=hidden)
+        one_action_loss, _, _ = model.compute_jepa_loss(torch.ones(8, 2, 4))
+        assert not torch.allclose(zero_action_loss.detach(), one_action_loss.detach())
+
+    def test_jepa_target_uses_ema(self) -> None:
+        """The target encoder should move by the configured EMA fraction."""
+        model, _ = _make_jepa_gru_model()
+        target_before = model.jepa_target_encoder[0].weight.detach().clone()
+        with torch.no_grad():
+            model.jepa_online_encoder[0].weight.add_(1.0)
+
+        model.update_jepa_target(0.996)
+
+        assert torch.allclose(model.jepa_target_encoder[0].weight, target_before + 0.004)
+
     def test_invalid_structure_is_rejected(self) -> None:
         """Unknown RNN/MLP structures should fail during construction."""
         with pytest.raises(ValueError, match="Unsupported structure"):
@@ -442,6 +519,23 @@ class TestRNNModelExplicitStateJITExport:
         assert (exported.shortcut_obs_start, exported.shortcut_obs_end) == (55, 64)
         assert exported.fusion_order == "gru_hidden,cnn_latent,shortcut"
 
+    def test_jepa_export_strips_predictor_and_records_v4_contract(self) -> None:
+        """Deployment export should retain online inference only and identify the new fusion order."""
+        model, obs = _make_jepa_gru_model()
+        exported = torch.jit.script(model.as_jit_with_explicit_state())
+        hidden = torch.zeros(1, NUM_ENVS, 32)
+        model.reset(hidden_state=hidden.clone())
+
+        expected = model(obs).detach()
+        actions, next_hidden = exported(obs["policy"], hidden)
+
+        assert torch.allclose(actions, expected, atol=1.0e-5)
+        assert torch.allclose(next_hidden, model.get_hidden_state(), atol=1.0e-5)
+        assert exported.format_version == 4
+        assert exported.fusion_order == "online_latent,gru_hidden,cnn_latent,shortcut"
+        assert not hasattr(exported, "jepa_target_encoder")
+        assert not hasattr(exported, "jepa_transition_predictor")
+
 
 @pytest.mark.filterwarnings("ignore:.*legacy TorchScript.*:DeprecationWarning")
 @pytest.mark.filterwarnings("ignore:.*will be removed.*:DeprecationWarning")
@@ -511,3 +605,16 @@ class TestRNNModelONNXExport:
                 output_names=exported.output_names,
             )
             onnx.checker.check_model(onnx.load(file.name))
+
+    def test_split_cnn_jepa_gru_mlp_onnx_export_matches_model(self) -> None:
+        """The ONNX wrapper should reproduce JEPA online inference and recurrent state."""
+        model, obs = _make_jepa_gru_model()
+        exported = model.eval().as_onnx(verbose=False).eval()
+        hidden = torch.zeros(1, NUM_ENVS, 32)
+        model.reset(hidden_state=hidden.clone())
+
+        expected = model(obs, stochastic_output=False).detach()
+        actual, next_hidden, _ = exported(obs["policy"], hidden)
+
+        assert torch.allclose(actual, expected, atol=1.0e-5)
+        assert torch.allclose(next_hidden, model.get_hidden_state(), atol=1.0e-5)

@@ -11,6 +11,7 @@ from tensordict import TensorDict
 import pytest
 
 from rsl_rl.storage import RolloutStorage
+from rsl_rl.utils import unpad_trajectories
 from tests.conftest import make_obs
 
 NUM_ENVS = 6
@@ -191,6 +192,17 @@ class TestRecurrentMiniBatchGenerator:
         num_epochs = 5
         batch_count = sum(1 for _ in storage.recurrent_mini_batch_generator(num_mini_batches, num_epochs))
         assert batch_count == num_mini_batches * num_epochs
+
+    def test_padded_actions_align_with_observation_trajectories(self) -> None:
+        """Action trajectories should use exactly the observation trajectory split and padding."""
+        storage, obs = _make_storage_and_obs()
+        _fill_with_identifiable_data(storage, obs)
+        storage.dones[2, 0] = 1
+
+        for batch in storage.recurrent_mini_batch_generator(2, num_epochs=1):
+            assert batch.trajectory_actions is not None
+            assert batch.masks is not None
+            assert torch.equal(unpad_trajectories(batch.trajectory_actions, batch.masks), batch.actions)
 
     def test_hidden_states_align_with_trajectory_starts(self) -> None:
         """Hidden states in each batch should correspond to trajectory start points, including after dones."""

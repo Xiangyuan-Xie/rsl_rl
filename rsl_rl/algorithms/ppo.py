@@ -196,6 +196,7 @@ class PPO:
         mean_rnd_loss = 0 if self.rnd else None
         # Symmetry loss
         mean_symmetry_loss = 0 if self.symmetry else None
+        mean_auxiliary_losses: dict[str, float] = {}
 
         # Get mini-batch generator
         if self.actor.is_recurrent or self.critic.is_recurrent:
@@ -276,6 +277,8 @@ class PPO:
                 value_loss = (batch.returns - values).pow(2).mean()
 
             loss = surrogate_loss + self.value_loss_coef * value_loss - self.entropy_coef * entropy.mean()
+            auxiliary_loss, auxiliary_metrics = self._compute_auxiliary_loss(batch)
+            loss = loss + auxiliary_loss
 
             # RND loss
             rnd_loss = self.rnd.compute_loss(batch.observations[:original_batch_size]) if self.rnd else None  # type: ignore
@@ -302,6 +305,7 @@ class PPO:
             nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
             nn.utils.clip_grad_norm_(self.critic.parameters(), self.max_grad_norm)
             self.optimizer.step()
+            self._after_optimizer_step()
             # Apply the gradients for RND
             if self.rnd:
                 self.rnd.optimizer.step()
@@ -316,6 +320,8 @@ class PPO:
             # Symmetry loss
             if mean_symmetry_loss is not None:
                 mean_symmetry_loss += symmetry_loss.item()
+            for name, value in auxiliary_metrics.items():
+                mean_auxiliary_losses[name] = mean_auxiliary_losses.get(name, 0.0) + value.item()
 
         # Divide the losses by the number of updates
         num_updates = self.num_learning_epochs * self.num_mini_batches
@@ -337,11 +343,19 @@ class PPO:
             loss_dict["rnd"] = mean_rnd_loss
         if self.symmetry:
             loss_dict["symmetry"] = mean_symmetry_loss
+        loss_dict.update({name: value / num_updates for name, value in mean_auxiliary_losses.items()})
 
         # Clear the storage
         self.storage.clear()
 
         return loss_dict
+
+    def _compute_auxiliary_loss(self, batch: RolloutStorage.Batch) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Return an optional actor auxiliary loss and its logging values."""
+        return torch.zeros((), device=self.device), {}
+
+    def _after_optimizer_step(self) -> None:
+        """Run an optional algorithm-specific hook after each optimizer step."""
 
     def train_mode(self) -> None:
         """Set train mode for learnable models."""

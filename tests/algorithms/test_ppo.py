@@ -10,6 +10,7 @@ from __future__ import annotations
 import torch
 from tensordict import TensorDict
 
+from rsl_rl.algorithms import JEPAPPO
 from rsl_rl.algorithms.ppo import PPO
 from rsl_rl.models import MLPModel, RNNModel
 from rsl_rl.storage import RolloutStorage
@@ -290,6 +291,71 @@ def test_cnn_gru_split_actor_updates_with_feedforward_critic() -> None:
 
     assert all(torch.isfinite(value).all() for value in metrics.values() if isinstance(value, torch.Tensor))
     assert all(parameter.grad is None or torch.all(torch.isfinite(parameter.grad)) for parameter in actor.parameters())
+
+
+def test_jepa_ppo_updates_actor_and_ema_target() -> None:
+    """JEPAPPO should optimize latent prediction without differentiating the EMA target."""
+    obs = make_obs(NUM_ENVS, 72)
+    obs_groups = {"actor": ["policy"], "critic": ["policy"]}
+    actor = RNNModel(
+        obs,
+        obs_groups,
+        "actor",
+        NUM_ACTIONS,
+        hidden_dims=[48],
+        activation="elu",
+        rnn_type="gru",
+        rnn_hidden_dim=32,
+        rnn_num_layers=1,
+        structure="split_cnn_jepa_gru_mlp",
+        recurrent_obs_range=(55, 72),
+        cnn_obs_range=(0, 55),
+        cnn_obs_shape=(11, 5),
+        cnn_channels=(32, 32, 8),
+        cnn_kernel_size=3,
+        cnn_output_dim=32,
+        shortcut_obs_range=(55, 64),
+        jepa_state_obs_range=(55, 68),
+        jepa_previous_action_obs_range=(68, 72),
+        jepa_prediction_steps=(1, 2, 4),
+        distribution_cfg={"class_name": "BetaDistribution", "action_range": (0.0, 1.0)},
+    )
+    critic = _make_critic(obs, obs_groups)
+    storage = RolloutStorage("rl", NUM_ENVS, NUM_STEPS, obs, [NUM_ACTIONS])
+    ppo = JEPAPPO(
+        actor,
+        critic,
+        storage,
+        num_learning_epochs=1,
+        num_mini_batches=2,
+        schedule="fixed",
+        jepa_prediction_times_ms=(10, 20, 40),
+    )
+    target_before = actor.jepa_target_encoder[0].weight.detach().clone()
+
+    with torch.inference_mode():
+        for step in range(NUM_STEPS):
+            ppo.act(obs)
+            dones = torch.zeros(NUM_ENVS)
+            if step == 3:
+                dones[0] = 1.0
+            ppo.process_env_step(obs, torch.randn(NUM_ENVS), dones, {})
+        ppo.compute_returns(obs)
+    metrics = ppo.update()
+
+    assert {
+        "jepa_loss",
+        "jepa_loss_10ms",
+        "jepa_loss_20ms",
+        "jepa_loss_40ms",
+        "jepa_prediction_cosine",
+        "jepa_latent_std",
+    } <= metrics.keys()
+    assert all(torch.isfinite(torch.tensor(value)) for value in metrics.values())
+    assert actor.jepa_online_encoder[0].weight.grad is not None
+    assert actor.rnn.rnn.weight_ih_l0.grad is not None
+    assert all(parameter.grad is None for parameter in actor.jepa_target_encoder.parameters())
+    assert not torch.allclose(actor.jepa_target_encoder[0].weight, target_before)
 
 
 class TestTimeoutBootstrapping:
